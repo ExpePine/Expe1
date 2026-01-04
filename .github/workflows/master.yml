@@ -1,0 +1,34 @@
+name: 🔄 Master Batch (T3 + T4)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  orchestrator:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 🚀 Trigger T3 & T4
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const run = (file) =>
+              github.rest.actions.createWorkflowDispatch({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                workflow_id: file,
+                ref: context.ref
+              });
+
+            run('s3.yml');
+            run('s4.yml');
+
+      - name: ✅ Done
+        run: echo "T3 and T4 triggered"
