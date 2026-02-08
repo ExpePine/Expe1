@@ -35,4 +35,4 @@ jobs:
       - env:
           SHARD_INDEX: ${{ matrix.shard }}
           CHECKPOINT_FILE: checkpoint_group1_${{ matrix.shard }}.txt
-        run: python run_scraper.py
+        run: python monthly_runner.py
