@@ -1,4 +1,4 @@
-name: T1 (Shards 0–4)
+name: Monthly runner T1 (Shards 0–4)
 
 on:
   workflow_dispatch:
