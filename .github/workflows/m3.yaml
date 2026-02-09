@@ -1,4 +1,4 @@
-name: Master runner T3 (Shards 10–14)
+name: Monthly runner T3 (Shards 10–14)
 
 on:
   workflow_dispatch:
