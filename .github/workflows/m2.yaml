@@ -1,7 +1,11 @@
 name: Monthly runner T2 (Shards 5–9)
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:   # manual run allowed
+  schedule:
+    # Runs 1st of every month at 5:00 PM IST
+    - cron: '30 11 1 * *'
+
 
 jobs:
   scrape:
