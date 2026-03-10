@@ -128,7 +128,7 @@ batch_list = []
 BATCH_SIZE = 50
 
 # ✅ CHANGE: Write starts from AJ, and ONLY writes scraped values (previous columns untouched)
-START_COL = "AY"  # first scraped value goes into AJ
+START_COL = "BD"  # first scraped value goes into AJ
 
 try:
     for i in range(last_i, len(company_list)):
