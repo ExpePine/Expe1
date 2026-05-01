@@ -115,7 +115,7 @@ except Exception as e:
 # ---------------- MAIN LOOP ---------------- #
 driver = create_driver()
 batch_list = []
-BATCH_SIZE = 10
+BATCH_SIZE = 100
 
 try:
     for i in range(last_i, len(company_list)):
