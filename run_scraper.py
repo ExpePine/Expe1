@@ -101,7 +101,7 @@ log("📊 Connecting to Google Sheets...")
 try:
     gc = gspread.service_account("credentials.json")
     sheet_main = gc.open("Stock List").worksheet("Sheet1")
-    sheet_data = gc.open("Tradingview Data Reel Experimental May").worksheet("Sheet5")
+    sheet_data = gc.open("Tradingview Data Reel Experimental May").worksheet("Sheet20")
 
     company_list = sheet_main.col_values(5)
     name_list = sheet_main.col_values(1)
