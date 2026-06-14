@@ -107,7 +107,7 @@ try:
     sheet_main = gc.open("Stock List").worksheet("Sheet1")
 
     # ✅ WRITE to MV2 for SQL -> Sheet2
-    sheet_data = gc.open("MV2 for SQL").worksheet("Sheet2")
+    sheet_data = gc.open("MV2 for SQL").worksheet("Sheet36")
 
     # ✅ CHANGE: URL links now from Column G (7)
     company_list = sheet_main.col_values(7)   # Column G
