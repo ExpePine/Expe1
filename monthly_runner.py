@@ -190,7 +190,7 @@ log("📊 Connecting to Google Sheets...")
 try:
     gc = gspread.service_account("credentials.json")
     sheet_main = gc.open("Stock List").worksheet("Sheet1")
-    sheet_data = gc.open("MV2 for SQL").worksheet("Sheet36")
+    sheet_data = gc.open("MV2 for SQL").worksheet("Sheet2")
 
     company_list = sheet_main.col_values(7)   # Column G — URLs
     name_list    = sheet_main.col_values(1)   # Column A — names (for logging)
