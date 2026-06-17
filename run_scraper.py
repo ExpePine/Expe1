@@ -205,7 +205,7 @@ except Exception as e:
 # ---------------- MAIN LOOP ---------------- #
 driver_ref = [create_driver()]   # list wrapper so retry wrapper can swap it
 batch_list = []
-BATCH_SIZE = 10
+BATCH_SIZE = 50
 
 # Track per-run stats
 stats = {"scraped": 0, "skipped": 0, "saved": 0}
