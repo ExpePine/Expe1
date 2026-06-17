@@ -25,7 +25,7 @@ SHARD_STEP  = int(os.getenv("SHARD_STEP", "1"))
 MAX_RETRIES = 3          # retries per URL before giving up
 RETRY_DELAY = 3          # seconds between retries
 BATCH_SIZE  = 50
-START_COL   = "B"        # first column to write scraped values
+START_COL   = "D"        # first column to write scraped values
 
 checkpoint_file = os.getenv("CHECKPOINT_FILE", f"checkpoint_{SHARD_INDEX}.txt")
 
