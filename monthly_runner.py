@@ -25,7 +25,7 @@ SHARD_STEP  = int(os.getenv("SHARD_STEP", "1"))
 MAX_RETRIES = 3          # retries per URL before giving up
 RETRY_DELAY = 3          # seconds between retries
 BATCH_SIZE  = 50
-START_COL   = "BU"        # first column to write scraped values
+START_COL   = "B"        # first column to write scraped values
 
 checkpoint_file = os.getenv("CHECKPOINT_FILE", f"checkpoint_{SHARD_INDEX}.txt")
 
@@ -190,7 +190,7 @@ log("📊 Connecting to Google Sheets...")
 try:
     gc = gspread.service_account("credentials.json")
     sheet_main = gc.open("Stock List").worksheet("Sheet1")
-    sheet_data = gc.open("MV2 for SQL").worksheet("Sheet2")
+    sheet_data = gc.open("MV2 for SQL").worksheet("Sheet36")
 
     company_list = sheet_main.col_values(7)   # Column G — URLs
     name_list    = sheet_main.col_values(1)   # Column A — names (for logging)
