@@ -2,7 +2,6 @@ import sys
 import os
 import time
 import json
-import random
 from datetime import date
 
 from selenium import webdriver
@@ -11,51 +10,40 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import (
-    NoSuchElementException, TimeoutException, WebDriverException
-)
+from selenium.common.exceptions import NoSuchElementException, TimeoutException, WebDriverException
 
 from bs4 import BeautifulSoup
 import gspread
 from webdriver_manager.chrome import ChromeDriverManager
 
-# ─────────────────────────────────────────────
-# LOGGING
-# ─────────────────────────────────────────────
 def log(msg):
     print(msg, flush=True)
 
-
-# ─────────────────────────────────────────────
-# CONFIG & SHARDING
-# ─────────────────────────────────────────────
-SHARD_INDEX     = int(os.getenv("SHARD_INDEX", "0"))
-SHARD_STEP      = int(os.getenv("SHARD_STEP",  "1"))
-MAX_RETRIES     = 3
-RETRY_BASE_DELAY= 4       # exponential backoff base (seconds)
-BATCH_SIZE      = 50
-START_COL       = "D"
-TV_BASE_URL     = "https://in.tradingview.com"
+# ---------------- CONFIG & SHARDING ---------------- #
+SHARD_INDEX = int(os.getenv("SHARD_INDEX", "0"))
+SHARD_STEP  = int(os.getenv("SHARD_STEP", "1"))
+MAX_RETRIES = 3          # retries per URL before giving up
+RETRY_DELAY = 3          # seconds between retries
+BATCH_SIZE  = 50
+START_COL   = "D"        # first column to write scraped values
 
 checkpoint_file = os.getenv("CHECKPOINT_FILE", f"checkpoint_{SHARD_INDEX}.txt")
 
-# Resume from last checkpoint (this is the NEXT row to process)
+# ✅ FIX: read checkpoint correctly — this is the LAST successfully written row
+# We'll resume FROM this row (not skip it)
 last_i = 0
 if os.path.exists(checkpoint_file):
     try:
         last_i = int(open(checkpoint_file).read().strip())
-        log(f"🔖 Checkpoint found — resuming from row index {last_i}")
-    except Exception:
+    except:
         last_i = 0
-        log("⚠️  Could not read checkpoint — starting from row 0")
-else:
-    log("🔖 No checkpoint — starting from row 0")
+
+log(f"🔖 Resuming from row index {last_i}")
 
 
-# ─────────────────────────────────────────────
-# BROWSER FACTORY  (with proper session/cookie)
-# ─────────────────────────────────────────────
-def _build_options() -> Options:
+# ---------------- BROWSER FACTORY ---------------- #
+def create_driver():
+    log("🌐 Initializing Chrome...")
     opts = Options()
     opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
@@ -63,511 +51,227 @@ def _build_options() -> Options:
     opts.add_argument("--disable-gpu")
     opts.add_argument("--window-size=1920,1080")
     opts.add_argument("--blink-settings=imagesEnabled=false")
-    opts.add_argument("--disable-extensions")
-    opts.add_argument("--disable-infobars")
-    opts.add_argument("--disable-notifications")
-    opts.add_experimental_option("excludeSwitches", ["enable-logging", "enable-automation"])
-    opts.add_experimental_option("useAutomationExtension", False)
+    opts.add_experimental_option("excludeSwitches", ["enable-logging"])
     opts.add_argument(
         "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
+        "Chrome/120.0.0.0 Safari/537.36"
     )
-    return opts
 
-
-def _clean_cookie(c: dict) -> dict:
-    """
-    Converts a cookie dict (e.g. from EditThisCookie / browser export) into the
-    minimal, valid format that Selenium's add_cookie() accepts.
-
-    Key rules:
-      • Only these fields are allowed: name, value, path, secure, expiry, domain, sameSite
-      • sameSite MUST be exactly "Strict", "Lax", or "None" — anything else is dropped
-      • domain must NOT include a leading dot for the current page's domain in some
-        Selenium versions; we normalise it but keep it so cross-subdomain cookies work
-      • expiry must be an int (Unix timestamp), not a float or string
-      • httpOnly, storeId, hostOnly, session, id, sameSite variants like "no_restriction"
-        are all silently dropped
-    """
-    SAMESITE_MAP = {
-        "strict":           "Strict",
-        "lax":              "Lax",
-        "none":             "None",
-        "no_restriction":   "None",   # Chrome DevTools / EditThisCookie alias
-        "unspecified":      "Lax",    # treat unknown as Lax (safe default)
-    }
-
-    clean: dict = {}
-
-    # Required fields
-    clean["name"]  = str(c.get("name",  ""))
-    clean["value"] = str(c.get("value", ""))
-
-    # Optional but useful
-    if "path" in c:
-        clean["path"] = str(c["path"])
-    if "secure" in c:
-        clean["secure"] = bool(c["secure"])
-    if "domain" in c:
-        # Normalise: remove leading dot (Selenium adds it automatically for sub-domains)
-        clean["domain"] = str(c["domain"]).lstrip(".")
-
-    # expiry — must be int
-    for key in ("expiry", "expirationDate", "expires"):
-        if key in c and c[key]:
-            try:
-                clean["expiry"] = int(float(c[key]))
-                break
-            except (ValueError, TypeError):
-                pass
-
-    # sameSite — must be one of the three accepted strings
-    raw_ss = str(c.get("sameSite", "")).lower()
-    mapped = SAMESITE_MAP.get(raw_ss)
-    if mapped:
-        clean["sameSite"] = mapped
-    # if not mappable, omit the key entirely (Selenium uses its own default)
-
-    return clean
-
-
-def _apply_cookies(driver: webdriver.Chrome) -> bool:
-    """
-    Loads cookies.json and injects them into the browser via JavaScript
-    (document.cookie) as a fallback when Selenium's add_cookie() rejects them.
-
-    Strategy:
-      1. Try Selenium add_cookie() with a cleaned dict  → most reliable
-      2. On failure, fall back to document.cookie via JS → works for non-HttpOnly cookies
-      3. For the two critical auth cookies (sessionid, sessionid_sign),
-         also try the JS path even if add_cookie succeeded, to be safe.
-
-    Must be called AFTER driver.get() has already navigated to the target domain.
-    Returns True if at least one cookie was applied.
-    """
-    cookie_path = "cookies.json"
-    if not os.path.exists(cookie_path):
-        log("ℹ️  No cookies.json found — continuing without session cookies")
-        return False
-
-    try:
-        with open(cookie_path, "r") as f:
-            raw_cookies = json.load(f)
-    except Exception as e:
-        log(f"⚠️  Could not read cookies.json: {e}")
-        return False
-
-    # Get current domain from the browser so we can filter to matching cookies
-    try:
-        current_url  = driver.current_url  # e.g. "https://in.tradingview.com/"
-        current_host = current_url.split("/")[2]  # "in.tradingview.com"
-        base_domain  = ".".join(current_host.split(".")[-2:])  # "tradingview.com"
-    except Exception:
-        base_domain  = "tradingview.com"
-
-    added_selenium = 0
-    added_js       = 0
-    failed         = 0
-
-    for c in raw_cookies:
-        name  = c.get("name", "?")
-        value = c.get("value", "")
-
-        # Skip cookies that clearly belong to a different domain
-        c_domain = str(c.get("domain", "")).lstrip(".")
-        if c_domain and base_domain not in c_domain:
-            log(f"   ⏭  Skipping cookie '{name}' (domain mismatch: {c_domain})")
-            continue
-
-        cleaned = _clean_cookie(c)
-
-        # ── Method 1: Selenium add_cookie ──
-        selenium_ok = False
-        try:
-            driver.add_cookie(cleaned)
-            added_selenium += 1
-            selenium_ok = True
-        except Exception as se:
-            err = str(se)
-            # ── Method 2: JS document.cookie (for non-HttpOnly cookies) ──
-            # Construct a cookie string: name=value; path=/; domain=.tradingview.com; ...
-            try:
-                parts = [f"{name}={value}", f"path={cleaned.get('path', '/')}"]
-                if "expiry" in cleaned:
-                    from datetime import datetime, timezone
-                    exp_dt = datetime.fromtimestamp(cleaned["expiry"], tz=timezone.utc)
-                    parts.append(f"expires={exp_dt.strftime('%a, %d %b %Y %H:%M:%S GMT')}")
-                if cleaned.get("secure"):
-                    parts.append("secure")
-                if "sameSite" in cleaned:
-                    parts.append(f"samesite={cleaned['sameSite']}")
-                # Use the base domain with leading dot for broad coverage
-                parts.append(f"domain=.{base_domain}")
-
-                cookie_str = "; ".join(parts)
-                driver.execute_script(f"document.cookie = {json.dumps(cookie_str)};")
-                added_js += 1
-            except Exception as je:
-                log(f"   ✘ Failed cookie '{name}' — selenium: {err[:50]} | js: {str(je)[:50]}")
-                failed += 1
-
-    total_added = added_selenium + added_js
-    log(f"✅ Cookies applied: {added_selenium} via Selenium + {added_js} via JS "
-        f"| {failed} failed | {total_added}/{len(raw_cookies)} total")
-    return total_added > 0
-
-
-def _validate_session(driver: webdriver.Chrome) -> bool:
-    """
-    Validates TradingView login by checking cookies AND page content.
-
-    TradingView session is confirmed by the presence of 'sessionid' cookie.
-    Page content check is a secondary signal.
-
-    Returns True  -> logged in
-    Returns False -> not logged in / session expired
-    """
-    try:
-        # Primary check: sessionid cookie must exist and be non-empty in the jar
-        session_cookie = driver.execute_script(
-            "return document.cookie.split(';').map(c => c.trim())"
-            ".find(c => c.startsWith('sessionid='));"
-        )
-        if session_cookie and len(session_cookie.split("=", 1)[1].strip()) > 10:
-            log(f"   🔑 Session cookie present: {session_cookie[:35]}...")
-            return True
-
-        # Secondary check: page source signals
-        page = driver.page_source.lower()
-        logged_in_signals  = ["usermenu", "user-menu", "my profile", "watchlist"]
-        logged_out_signals = ["sign in", "log in", "create account", "get started for free"]
-
-        has_in  = any(s in page for s in logged_in_signals)
-        has_out = any(s in page for s in logged_out_signals)
-
-        if has_in and not has_out:
-            return True
-        if has_out and not has_in:
-            return False
-
-        # Ambiguous: default True so scraping is not blocked unnecessarily
-        return True
-
-    except Exception as e:
-        log(f"   ⚠️  Session validation error: {str(e)[:60]}")
-        return False
-
-
-def create_driver() -> webdriver.Chrome:
-    """
-    Spins up a Chrome instance, loads the TradingView homepage,
-    injects session cookies, refreshes, and validates the session.
-    """
-    log("🌐 Initialising Chrome...")
     driver = webdriver.Chrome(
         service=Service(ChromeDriverManager().install()),
-        options=_build_options()
+        options=opts
     )
-    driver.set_page_load_timeout(45)
+    driver.set_page_load_timeout(40)
 
-    # ── Step 1: Navigate to base domain first (cookies are domain-bound) ──
-    try:
-        driver.get(TV_BASE_URL)
-        # Wait for the page to be at least partially loaded before injecting cookies
-        WebDriverWait(driver, 20).until(
-            lambda d: d.execute_script("return document.readyState") == "complete"
-        )
-        time.sleep(2)  # small extra buffer for JS hydration
-    except Exception as e:
-        log(f"⚠️  Could not load base URL: {str(e)[:80]}")
-
-    # ── Step 2: Inject cookies ──
-    cookies_ok = _apply_cookies(driver)
-
-    # ── Step 3: Refresh so the server recognises the session ──
-    if cookies_ok:
+    if os.path.exists("cookies.json"):
         try:
+            driver.get("https://in.tradingview.com/")
+            time.sleep(3)
+            with open("cookies.json", "r") as f:
+                cookies = json.load(f)
+            for c in cookies:
+                try:
+                    driver.add_cookie({
+                        k: v for k, v in c.items()
+                        if k in ("name", "value", "path", "secure", "expiry")
+                    })
+                except:
+                    continue
             driver.refresh()
-            WebDriverWait(driver, 20).until(
-                lambda d: d.execute_script("return document.readyState") == "complete"
-            )
             time.sleep(2)
-        except Exception:
-            pass
-
-        # ── Step 4: Validate session ──
-        if _validate_session(driver):
-            log("✅ Session validated — logged in")
-        else:
-            log("⚠️  Session validation failed — cookies may be stale; continuing anyway")
+            log("✅ Cookies applied")
+        except Exception as e:
+            log(f"⚠️ Cookie error: {str(e)[:60]}")
 
     return driver
 
 
-# ─────────────────────────────────────────────
-# SCRAPER
-# ─────────────────────────────────────────────
-
-# Multiple CSS selectors to try in priority order.
-# TradingView sometimes renames classes; having fallbacks makes this resilient.
-VALUE_SELECTORS = [
-    "div.valueValue-l31H9iuA.apply-common-tooltip",  # most specific
-    "div.valueValue-l31H9iuA",                         # class only
-    "[class*='valueValue']",                            # partial class match
-    "[class*='apply-common-tooltip'][class*='value']",  # combined partial
-]
-
-def _extract_values(page_source: str) -> list:
-    """Parse the page and extract all financial values using multiple strategies."""
-    soup = BeautifulSoup(page_source, "html.parser")
-
-    for selector in VALUE_SELECTORS:
-        elements = soup.select(selector)
-        if elements:
-            values = []
-            for el in elements:
-                text = (el.get_text()
-                        .replace('−', '-')
-                        .replace('∅', 'None')
-                        .replace('\u2212', '-')   # Unicode minus sign
-                        .replace('\xa0', ' ')     # non-breaking space
-                        .strip())
-                if text:
-                    values.append(text)
-            if values:
-                log(f"   ✔ Found {len(values)} values via selector: {selector}")
-                return values
-
-    log("   ✘ No values found with any selector")
-    return []
-
-
-def scrape_tradingview(driver: webdriver.Chrome, url: str):
+# ---------------- SCRAPER LOGIC ---------------- #
+def scrape_tradingview(driver, url):
     """
     Returns:
-        list  — extracted values (may be empty if page loaded but had no data)
-        "RESTART" — browser crashed / unrecoverable WebDriver error
+      - list of values (possibly empty) on success
+      - "RESTART" if browser crashed
     """
     try:
         driver.get(url)
 
-        # Wait for ANY matching value element to appear
-        found = False
-        for selector in VALUE_SELECTORS:
-            try:
-                WebDriverWait(driver, 40).until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, selector))
-                )
-                found = True
-                break
-            except TimeoutException:
-                continue
+        # ✅ FIX: Use a CSS class wait instead of a brittle full XPath.
+        # Wait for ANY element with this class to appear — much more resilient.
+        WebDriverWait(driver, 45).until(
+            EC.presence_of_element_located((
+                By.CSS_SELECTOR,
+                "div.valueValue-l31H9iuA"
+            ))
+        )
 
-        if not found:
-            log("⏱️ Timeout — no value elements appeared")
-            return []
-
-        # Let remaining values finish rendering
+        # Small extra wait to let all values render
         time.sleep(1.5)
 
-        return _extract_values(driver.page_source)
+        soup = BeautifulSoup(driver.page_source, "html.parser")
+        values = [
+            el.get_text().replace('−', '-').replace('∅', 'None').strip()
+            for el in soup.find_all(
+                "div",
+                class_="valueValue-l31H9iuA apply-common-tooltip"
+            )
+        ]
+        return values
 
     except TimeoutException:
-        log("⏱️ Page load timeout")
+        log("⏱️ Timeout waiting for values")
         return []
     except NoSuchElementException:
         log("❌ Element not found")
         return []
     except WebDriverException as e:
-        msg = str(e)
-        # Distinguish a crash from a mere navigation error
-        if any(k in msg for k in ("chrome not reachable", "session deleted",
-                                   "no such session", "disconnected")):
-            log(f"🛑 Browser crash detected: {msg[:80]}")
-            return "RESTART"
-        log(f"⚠️  WebDriverException (non-crash): {msg[:80]}")
-        return []
-    except Exception as e:
-        log(f"⚠️  Unexpected error: {str(e)[:80]}")
-        return []
+        log(f"🛑 Browser crash: {str(e)[:80]}")
+        return "RESTART"
 
 
-def scrape_with_retry(driver: webdriver.Chrome, url: str, name: str):
+def scrape_with_retry(driver, url, name, max_retries=MAX_RETRIES):
     """
-    Retries scraping up to MAX_RETRIES times with exponential backoff.
-    Restarts the browser on crash and re-applies the session.
-    Returns (driver, values_list).
+    Wraps scrape_tradingview with retry logic and browser restart on crash.
+    Returns (driver, values_list_or_empty).
     """
-    for attempt in range(1, MAX_RETRIES + 1):
+    for attempt in range(1, max_retries + 1):
         result = scrape_tradingview(driver, url)
 
-        # ── Browser crash → restart & re-apply session ──
         if result == "RESTART":
-            log(f"♻️  Restarting browser (attempt {attempt}/{MAX_RETRIES})...")
+            log(f"♻️ Restarting browser (attempt {attempt})")
             try:
                 driver.quit()
-            except Exception:
+            except:
                 pass
             driver = create_driver()
-
-            # One immediate retry after restart
+            # retry immediately after restart
             result = scrape_tradingview(driver, url)
             if result == "RESTART":
-                log("🛑 Second crash after restart — skipping row")
+                log("🛑 Browser restart failed twice, skipping row")
                 return driver, []
-            # Fall through: result is now a list (possibly empty)
 
-        if isinstance(result, list) and result:
+        if isinstance(result, list) and len(result) > 0:
             return driver, result
 
-        # Empty list → wait with exponential back-off and retry
-        if attempt < MAX_RETRIES:
-            delay = RETRY_BASE_DELAY * (2 ** (attempt - 1)) + random.uniform(0, 1)
-            log(f"   ⚠️  Empty result for '{name}' — retry {attempt}/{MAX_RETRIES} in {delay:.1f}s")
-            time.sleep(delay)
+        # Empty result — wait and retry
+        if attempt < max_retries:
+            log(f"⚠️ Empty result for {name}, retry {attempt}/{max_retries} in {RETRY_DELAY}s...")
+            time.sleep(RETRY_DELAY)
+        else:
+            log(f"❌ All {max_retries} attempts failed for {name}")
 
-    log(f"   ❌ All {MAX_RETRIES} attempts failed for '{name}'")
     return driver, []
 
 
-# ─────────────────────────────────────────────
-# GOOGLE SHEETS BATCH WRITER
-# ─────────────────────────────────────────────
-def flush_batch(sheet: gspread.Worksheet, batch_list: list):
-    """
-    Writes batch_list to Google Sheets.
-    batch_list items must be dicts: {"range": "D5", "values": [[v1, v2, ...]]}
-
-    gspread's batch_update expects the list directly.
-    Retries up to 3× with increasing back-off on quota errors.
-    """
+# ---------------- FLUSH BATCH TO SHEETS ---------------- #
+def flush_batch(sheet, batch_list):
+    """Write a batch to Google Sheets, with quota-retry."""
     if not batch_list:
         return
-
-    for attempt in range(1, 4):
+    for attempt in range(3):
         try:
-            sheet.batch_update(batch_list, value_input_option="USER_ENTERED")
-            log(f"🚀 Saved {len(batch_list)} rows to sheet")
+            sheet.batch_update(batch_list)
+            log(f"🚀 Saved {len(batch_list)} rows")
             return
-        except gspread.exceptions.APIError as e:
-            status = e.response.status_code if hasattr(e, 'response') else 0
-            log(f"   ⚠️  Sheets API error (HTTP {status}): {str(e)[:80]}")
-            if status == 429:
-                wait = 60 * attempt
-                log(f"   ⏳ Quota hit — sleeping {wait}s...")
+        except Exception as e:
+            log(f"⚠️ Sheets API error: {e}")
+            if "429" in str(e) or "quota" in str(e).lower():
+                wait = 60 * (attempt + 1)
+                log(f"⏳ Quota hit — sleeping {wait}s...")
                 time.sleep(wait)
             else:
-                time.sleep(5 * attempt)
-        except Exception as e:
-            log(f"   ⚠️  Unexpected Sheets error: {str(e)[:80]}")
-            time.sleep(5 * attempt)
-
-    log("❌ Batch failed after 3 attempts — data lost for this batch")
+                time.sleep(5)
+    log("❌ Batch failed after 3 attempts — data may be lost for this batch")
 
 
-def save_checkpoint(i: int):
-    """Save the index of the NEXT row to process."""
-    try:
-        with open(checkpoint_file, "w") as f:
-            f.write(str(i + 1))
-    except Exception as e:
-        log(f"⚠️  Checkpoint write failed: {e}")
-
-
-# ─────────────────────────────────────────────
-# GOOGLE SHEETS SETUP
-# ─────────────────────────────────────────────
+# ---------------- INITIAL SETUP ---------------- #
 log("📊 Connecting to Google Sheets...")
 try:
-    gc           = gspread.service_account("credentials.json")
-    sheet_main   = gc.open("Stock List").worksheet("Sheet1")
-    sheet_data   = gc.open("MV2 for SQL").worksheet("Sheet36")
+    gc = gspread.service_account("credentials.json")
+    sheet_main = gc.open("Stock List").worksheet("Sheet1")
+    sheet_data = gc.open("MV2 for SQL").worksheet("Sheet36")
 
     company_list = sheet_main.col_values(7)   # Column G — URLs
-    name_list    = sheet_main.col_values(1)   # Column A — names
+    name_list    = sheet_main.col_values(1)   # Column A — names (for logging)
 
     current_date = date.today().strftime("%m/%d/%Y")
-    log(f"✅ Loaded {len(company_list)} rows | "
-        f"Shard {SHARD_INDEX}/{SHARD_STEP} | "
-        f"Resume from row index {last_i}")
+    log(f"✅ Loaded {len(company_list)} rows | Shard {SHARD_INDEX}/{SHARD_STEP} | Resume from {last_i}")
 except Exception as e:
-    log(f"❌ Setup error: {e}")
+    log(f"❌ Setup Error: {e}")
     sys.exit(1)
 
 
-# ─────────────────────────────────────────────
-# MAIN LOOP
-# ─────────────────────────────────────────────
-driver     = create_driver()
+# ---------------- MAIN LOOP ---------------- #
+driver = create_driver()
 batch_list = []
 
-attempted         = 0
-succeeded         = 0
+# Track which rows we actually attempted vs succeeded, for a summary at the end
+attempted = 0
+succeeded = 0
 skipped_empty_url = 0
-skipped_no_data   = 0
+skipped_no_data = 0
 
 try:
-    total = len(company_list)
+    for i in range(len(company_list)):
 
-    for i in range(total):
-
-        # ── Shard filtering ──
+        # ✅ FIX 1: Shard filtering — each worker handles its own slice
+        # Shard 0 of 4: rows 0,4,8,...   Shard 1: rows 1,5,9,...  etc.
         if SHARD_STEP > 1 and (i % SHARD_STEP) != SHARD_INDEX:
             continue
 
-        # ── Resume from checkpoint ──
+        # ✅ FIX 2: Resume — skip rows already processed in a previous run
         if i < last_i:
             continue
 
-        # ── Hard cap ──
+        # Hard cap (adjust per your sheet size)
         if i >= 2600:
-            log("🏁 Reached row cap (2600) — stopping")
             break
-
-        # ── Skip header row (index 0 = Sheet row 1) ──
-        if i == 0:
-            log("⏭️  Skipping header row")
-            save_checkpoint(i)
-            continue
 
         url  = company_list[i].strip() if i < len(company_list) and company_list[i] else ""
         name = name_list[i].strip()    if i < len(name_list)    and name_list[i]    else f"Row {i+1}"
 
-        # ── Skip blank URLs ──
-        if not url:
-            log(f"⏭️  [{i+1}] '{name}' — empty URL")
-            skipped_empty_url += 1
-            save_checkpoint(i)
+        # Skip header row (row 0 in 0-indexed = row 1 in sheet)
+        if i == 0:
+            log(f"⏭️ Skipping header row 1")
             continue
 
-        log(f"🔍 [{i+1}/{total}] {name}")
+        # Skip blank URLs
+        if not url:
+            log(f"⏭️ [{i+1}] {name} — empty URL")
+            skipped_empty_url += 1
+            # ✅ FIX 3: Still advance checkpoint so we don't re-visit this row
+            with open(checkpoint_file, "w") as f:
+                f.write(str(i + 1))
+            continue
+
+        log(f"🔍 [{i+1}] {name}")
         attempted += 1
 
         driver, values = scrape_with_retry(driver, url, name)
 
         if values:
-            sheet_row = i + 1          # Sheets is 1-indexed
+            target_row = i + 1  # Sheets rows are 1-indexed
             batch_list.append({
-                "range":  f"{START_COL}{sheet_row}",
+                "range": f"{START_COL}{target_row}",
                 "values": [values]
             })
             succeeded += 1
-            log(f"   📦 Buffered {len(values)} values | batch size {len(batch_list)}/{BATCH_SIZE}")
+            log(f"📦 Buffered {len(values)} values | batch {len(batch_list)}/{BATCH_SIZE}")
         else:
             skipped_no_data += 1
-            log(f"   ⚠️  [{i+1}] '{name}' — no data after all retries")
+            log(f"⚠️ [{i+1}] {name} — no data after retries")
 
-        # ── Flush when batch is full ──
+        # Flush batch to Sheets
         if len(batch_list) >= BATCH_SIZE:
             flush_batch(sheet_data, batch_list)
             batch_list = []
 
-        # ── Checkpoint after every row ──
-        save_checkpoint(i)
+        # Save checkpoint AFTER successful processing
+        with open(checkpoint_file, "w") as f:
+            f.write(str(i + 1))
 
-        # Polite delay (randomised to look more human)
-        time.sleep(random.uniform(0.4, 0.9))
+        time.sleep(0.5)  # polite delay
 
 finally:
     # Flush any remaining rows
@@ -576,10 +280,10 @@ finally:
 
     try:
         driver.quit()
-    except Exception:
+    except:
         pass
 
-    log("=" * 55)
-    log(f"🏁 DONE  |  Attempted: {attempted}  |  Succeeded: {succeeded}  |"
-        f"  No-data: {skipped_no_data}  |  Empty-URL: {skipped_empty_url}")
-    log("=" * 55)
+    log("=" * 50)
+    log(f"🏁 Done | Attempted: {attempted} | Succeeded: {succeeded} | "
+        f"No-data: {skipped_no_data} | Empty-URL: {skipped_empty_url}")
+    log("=" * 50)
