@@ -23,7 +23,7 @@ START_ROW = SHARD_INDEX * SHARD_SIZE
 END_ROW = START_ROW + SHARD_SIZE
 checkpoint_file = os.getenv("CHECKPOINT_FILE", f"checkpoint_day_{SHARD_INDEX}.txt")
 
-EXPECTED_COUNT = 18  # Kept strictly at 18 values
+EXPECTED_COUNT = 18  
 BATCH_SIZE = 50 
 RESTART_EVERY_ROWS = 20
 COOKIE_FILE = os.getenv("COOKIE_FILE", "cookies.json")
@@ -71,13 +71,20 @@ driver = None
 def create_driver():
     log(f"🌐 [Shard {SHARD_INDEX}] Initializing browser...")
     opts = Options()
+    
+    # Target system binary on Ubuntu environments
+    if os.path.exists("/usr/bin/google-chrome"):
+        opts.binary_location = "/usr/bin/google-chrome"
+        
     opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-setuid-sandbox")  # CRITICAL: Fixes blank crash inside Docker/Linux Actions
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--disable-gpu")
+    opts.add_argument("--single-process")           # CRITICAL: Limits memory profile inside container environment
+    opts.add_argument("--remote-debugging-pipe")    # Avoids port binding crashes
     
-    # CRITICAL GITHUB ACTIONS FLAGS: Prevents silent browser crash in containers
-    opts.add_argument("--remote-debugging-pipe")
+    # Dedicated temp structures for isolation
     opts.add_argument("--user-data-dir=/tmp/chrome-user-data")
     opts.add_argument("--data-path=/tmp/chrome-data-path")
     opts.add_argument("--disk-cache-dir=/tmp/chrome-cache")
@@ -87,7 +94,7 @@ def create_driver():
     opts.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
     drv = webdriver.Chrome(options=opts)
-    drv.set_page_load_timeout(30)
+    drv.set_page_load_timeout(35)
     
     if os.path.exists(COOKIE_FILE):
         try:
@@ -178,7 +185,7 @@ def connect_sheets():
 try:
     sheet_main, sheet_data = connect_sheets()
     company_list = api_retry(sheet_main.col_values, 1)
-    url_list = api_retry(sheet_main.col_values, 7)  # Column G Parsing Configured
+    url_list = api_retry(sheet_main.col_values, 7)  
     
     log(f"✅ Starting rows {last_i + 1} to {min(END_ROW, len(company_list))}")
 except Exception as e:
