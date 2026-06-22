@@ -24,7 +24,7 @@ START_ROW = SHARD_INDEX * SHARD_SIZE
 END_ROW = START_ROW + SHARD_SIZE
 checkpoint_file = os.getenv("CHECKPOINT_FILE", f"checkpoint_day_{SHARD_INDEX}.txt")
 
-EXPECTED_COUNT = 18  # Updated count as requested
+EXPECTED_COUNT = 18  
 BATCH_SIZE = 50 
 RESTART_EVERY_ROWS = 20
 COOKIE_FILE = os.getenv("COOKIE_FILE", "cookies.json")
@@ -187,7 +187,10 @@ def process_row(i, company_list, url_list, current_date):
 try:
     sheet_main, sheet_data = connect_sheets()
     company_list = api_retry(sheet_main.col_values, 1)
-    url_list = api_retry(sheet_main.col_values, 4)
+    
+    # URL List targets Column G (7)
+    url_list = api_retry(sheet_main.col_values, 7)
+    
     log(f"✅ Starting rows {last_i + 1} to {min(END_ROW, len(company_list))}")
 except Exception as e:
     log(f"❌ Connection Error: {e}")
