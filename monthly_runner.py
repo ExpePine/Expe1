@@ -72,22 +72,21 @@ def create_driver():
     log(f"🌐 [Shard {SHARD_INDEX}] Initializing browser...")
     opts = Options()
     
-    # Target system binary on Ubuntu environments
     if os.path.exists("/usr/bin/google-chrome"):
         opts.binary_location = "/usr/bin/google-chrome"
         
     opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-setuid-sandbox")  # CRITICAL: Fixes blank crash inside Docker/Linux Actions
+    opts.add_argument("--disable-setuid-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--disable-gpu")
-    opts.add_argument("--single-process")           # CRITICAL: Limits memory profile inside container environment
-    opts.add_argument("--remote-debugging-pipe")    # Avoids port binding crashes
+    opts.add_argument("--remote-debugging-pipe")
     
-    # Dedicated temp structures for isolation
-    opts.add_argument("--user-data-dir=/tmp/chrome-user-data")
-    opts.add_argument("--data-path=/tmp/chrome-data-path")
-    opts.add_argument("--disk-cache-dir=/tmp/chrome-cache")
+    # Randomize temporary allocations to prevent session locking
+    rand_id = random.randint(1000, 9999)
+    opts.add_argument(f"--user-data-dir=/tmp/chrome-user-data-{rand_id}")
+    opts.add_argument(f"--data-path=/tmp/chrome-data-path-{rand_id}")
+    opts.add_argument(f"--disk-cache-dir=/tmp/chrome-cache-{rand_id}")
     
     opts.add_argument("--window-size=1920,1080")
     opts.add_argument("--disable-blink-features=AutomationControlled")
@@ -99,15 +98,19 @@ def create_driver():
     if os.path.exists(COOKIE_FILE):
         try:
             drv.get("https://in.tradingview.com/")
-            time.sleep(2)
+            time.sleep(3)
             with open(COOKIE_FILE, "r", encoding="utf-8") as f:
                 cookies = json.load(f)
             for c in cookies:
-                drv.add_cookie({k: v for k, v in c.items() if k in ("name", "value", "path", "secure", "expiry")})
+                # Core cookie sanitization payload mapping
+                cookie_dict = {k: v for k, v in c.items() if k in ("name", "value", "path", "secure", "expiry")}
+                if "expiry" in cookie_dict:
+                    cookie_dict["expiry"] = int(cookie_dict["expiry"])
+                drv.add_cookie(cookie_dict)
             drv.refresh()
-            time.sleep(2)
-        except Exception:
-            pass
+            time.sleep(3)
+        except Exception as e:
+            log(f"   ⚠️ Warning: Cookie injection tracking failed: {str(e)[:40]}")
     return drv
 
 def ensure_driver():
