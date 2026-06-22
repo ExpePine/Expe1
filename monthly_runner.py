@@ -23,7 +23,7 @@ START_ROW = SHARD_INDEX * SHARD_SIZE
 END_ROW = START_ROW + SHARD_SIZE
 checkpoint_file = os.getenv("CHECKPOINT_FILE", f"checkpoint_day_{SHARD_INDEX}.txt")
 
-EXPECTED_COUNT = 18  # Targeted count exactly at 18 values
+EXPECTED_COUNT = 18  # Kept strictly at 18 values
 BATCH_SIZE = 50 
 RESTART_EVERY_ROWS = 20
 COOKIE_FILE = os.getenv("COOKIE_FILE", "cookies.json")
@@ -75,11 +75,17 @@ def create_driver():
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--disable-gpu")
+    
+    # CRITICAL GITHUB ACTIONS FLAGS: Prevents silent browser crash in containers
+    opts.add_argument("--remote-debugging-pipe")
+    opts.add_argument("--user-data-dir=/tmp/chrome-user-data")
+    opts.add_argument("--data-path=/tmp/chrome-data-path")
+    opts.add_argument("--disk-cache-dir=/tmp/chrome-cache")
+    
     opts.add_argument("--window-size=1920,1080")
     opts.add_argument("--disable-blink-features=AutomationControlled")
     opts.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
-    # Native Selenium fallback execution avoids driver collision errors
     drv = webdriver.Chrome(options=opts)
     drv.set_page_load_timeout(30)
     
@@ -158,7 +164,7 @@ def scrape_day(url):
         except Exception as err:
             log(f"   ❌ Attempt {attempt + 1} Failed: {str(err)[:60]}")
             restart_driver()
-            time.sleep(2)  # Critical delay window allows context allocation to refresh cleanly
+            time.sleep(2)  
             
     return [""] * EXPECTED_COUNT, "NOT OK", url, ""
 
@@ -168,6 +174,21 @@ def connect_sheets():
     sh_main = gc.open("STOCKLIST 2").worksheet("Sheet1")
     sh_data = gc.open("MV2 DAY").worksheet("Sheet1")
     return sh_main, sh_data
+
+try:
+    sheet_main, sheet_data = connect_sheets()
+    company_list = api_retry(sheet_main.col_values, 1)
+    url_list = api_retry(sheet_main.col_values, 7)  # Column G Parsing Configured
+    
+    log(f"✅ Starting rows {last_i + 1} to {min(END_ROW, len(company_list))}")
+except Exception as e:
+    log(f"❌ Connection Error: {e}")
+    sys.exit(1)
+
+retry_indices = []
+batch_list = []
+current_date = date.today().strftime("%m/%d/%Y")
+loop_end = min(END_ROW, len(company_list))
 
 def process_row(i, company_list, url_list, current_date):
     name = company_list[i].strip() if i < len(company_list) else ""
@@ -186,21 +207,6 @@ def process_row(i, company_list, url_list, current_date):
         {"range": f"{BROWSER_URL_COL}{row_idx}", "values": [[browser_url_used]]}
     ]
     return row_payload, (status == "OK")
-
-try:
-    sheet_main, sheet_data = connect_sheets()
-    company_list = api_retry(sheet_main.col_values, 1)
-    url_list = api_retry(sheet_main.col_values, 7)  # Column G Tracking Applied
-    
-    log(f"✅ Starting rows {last_i + 1} to {min(END_ROW, len(company_list))}")
-except Exception as e:
-    log(f"❌ Connection Error: {e}")
-    sys.exit(1)
-
-retry_indices = []
-batch_list = []
-current_date = date.today().strftime("%m/%d/%Y")
-loop_end = min(END_ROW, len(company_list))
 
 # --- FIRST PASS ---
 for i in range(last_i, loop_end):
