@@ -182,7 +182,7 @@ def process_row(i, company_list, url_list, current_date):
 try:
     sheet_main, sheet_data = connect_sheets()
     company_list = api_retry(sheet_main.col_values, 1)
-    url_list = api_retry(sheet_main.col_values, 4)
+    url_list = api_retry(sheet_main.col_values, 7)
     log(f"✅ Starting rows {last_i + 1} to {min(END_ROW, len(company_list))}")
 except Exception as e:
     log(f"❌ Connection Error: {e}")
