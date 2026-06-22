@@ -39,15 +39,12 @@ checkpoint_file = os.getenv("CHECKPOINT_FILE", f"checkpoint_{SHARD_INDEX}.txt")
 last_i = 0
 if os.path.exists(checkpoint_file):
     try:
-        last_i = int(open(checkpoint_file).read().strip())
-    except:
+        with open(checkpoint_file, "r") as f:
+            last_i = int(f.read().strip())
+    except Exception:
         last_i = 0
 
 log(f"🔖 Resuming from row index {last_i}")
-
-# Keep same path/selector focus
-PRIMARY_SELECTOR = "div.valueValue-l31H9iuA.apply-common-tooltip"
-FALLBACK_SELECTOR = "div.valueValue-l31H9iuA"
 
 # ---------------- BROWSER FACTORY ---------------- #
 def create_driver():
@@ -89,7 +86,7 @@ def create_driver():
                         if k in ("name", "value", "path", "domain", "secure", "expiry")
                     }
                     driver.add_cookie(cookie)
-                except:
+                except Exception:
                     continue
             driver.refresh()
             time.sleep(2)
@@ -103,46 +100,24 @@ def safe_quit(driver):
     try:
         if driver:
             driver.quit()
-    except:
+    except Exception:
         pass
 
 # ---------------- HELPER: EXTRACT TEXT FROM SAME PLACE ---------------- #
 def extract_values_from_same_place(driver):
-    values = []
-
-    selectors = [PRIMARY_SELECTOR, FALLBACK_SELECTOR]
-
-    for selector in selectors:
-        try:
-            elements = driver.find_elements(By.CSS_SELECTOR, selector)
-            if not elements:
-                continue
-
-            temp = []
-            for el in elements:
-                try:
-                    txt = (
-                        el.get_attribute("innerText")
-                        or el.get_attribute("textContent")
-                        or el.text
-                        or ""
-                    )
-                    txt = txt.replace('−', '-').replace('∅', 'None').strip()
-                    if txt:
-                        temp.append(txt)
-                except StaleElementReferenceException:
-                    continue
-                except Exception:
-                    continue
-
-            if temp:
-                values = temp
-                break
-
-        except Exception:
-            continue
-
-    return values
+    try:
+        elements = driver.find_elements(By.CSS_SELECTOR, "[class*='valueValue']")
+        values = []
+        for el in elements:
+            try:
+                txt = el.text.strip()
+                if txt:
+                    values.append(txt)
+            except Exception:
+                pass
+        return values
+    except Exception:
+        return []
 
 def wait_for_values(driver, timeout=45, poll=1.0):
     end_time = time.time() + timeout
@@ -154,9 +129,7 @@ def wait_for_values(driver, timeout=45, poll=1.0):
             return values
 
         try:
-            count1 = len(driver.find_elements(By.CSS_SELECTOR, PRIMARY_SELECTOR))
-            count2 = len(driver.find_elements(By.CSS_SELECTOR, FALLBACK_SELECTOR))
-            last_count = max(count1, count2)
+            last_count = len(driver.find_elements(By.CSS_SELECTOR, "[class*='valueValue']"))
         except Exception:
             pass
 
@@ -175,14 +148,34 @@ def scrape_tradingview(driver, url):
     """
     try:
         driver.get(url)
+        log(f"URL: {url}")
+        time.sleep(3)
+
+        log(f"TITLE: {driver.title}")
+        log(f"CURRENT URL: {driver.current_url}")
+
+        count = len(driver.find_elements(By.CSS_SELECTOR, "[class*='valueValue']"))
+        log(f"valueValue elements found: {count}")
 
         WebDriverWait(driver, 30).until(
             lambda d: d.execute_script("return document.readyState") == "complete"
         )
-
         time.sleep(2)
 
         values = wait_for_values(driver, timeout=30, poll=1.0)
+
+        if len(values) < 30:
+            for scroll_y in [600, 1200, 2000]:
+                driver.execute_script(f"window.scrollTo(0,{scroll_y});")
+                time.sleep(1.5)
+                
+                new_values = extract_values_from_same_place(driver)
+                if len(new_values) > len(values):
+                    values = new_values
+
+                if len(values) >= 30:
+                    break
+
         return values
 
     except TimeoutException:
