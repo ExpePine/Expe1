@@ -76,13 +76,75 @@ def _build_options() -> Options:
     return opts
 
 
+def _clean_cookie(c: dict) -> dict:
+    """
+    Converts a cookie dict (e.g. from EditThisCookie / browser export) into the
+    minimal, valid format that Selenium's add_cookie() accepts.
+
+    Key rules:
+      • Only these fields are allowed: name, value, path, secure, expiry, domain, sameSite
+      • sameSite MUST be exactly "Strict", "Lax", or "None" — anything else is dropped
+      • domain must NOT include a leading dot for the current page's domain in some
+        Selenium versions; we normalise it but keep it so cross-subdomain cookies work
+      • expiry must be an int (Unix timestamp), not a float or string
+      • httpOnly, storeId, hostOnly, session, id, sameSite variants like "no_restriction"
+        are all silently dropped
+    """
+    SAMESITE_MAP = {
+        "strict":           "Strict",
+        "lax":              "Lax",
+        "none":             "None",
+        "no_restriction":   "None",   # Chrome DevTools / EditThisCookie alias
+        "unspecified":      "Lax",    # treat unknown as Lax (safe default)
+    }
+
+    clean: dict = {}
+
+    # Required fields
+    clean["name"]  = str(c.get("name",  ""))
+    clean["value"] = str(c.get("value", ""))
+
+    # Optional but useful
+    if "path" in c:
+        clean["path"] = str(c["path"])
+    if "secure" in c:
+        clean["secure"] = bool(c["secure"])
+    if "domain" in c:
+        # Normalise: remove leading dot (Selenium adds it automatically for sub-domains)
+        clean["domain"] = str(c["domain"]).lstrip(".")
+
+    # expiry — must be int
+    for key in ("expiry", "expirationDate", "expires"):
+        if key in c and c[key]:
+            try:
+                clean["expiry"] = int(float(c[key]))
+                break
+            except (ValueError, TypeError):
+                pass
+
+    # sameSite — must be one of the three accepted strings
+    raw_ss = str(c.get("sameSite", "")).lower()
+    mapped = SAMESITE_MAP.get(raw_ss)
+    if mapped:
+        clean["sameSite"] = mapped
+    # if not mappable, omit the key entirely (Selenium uses its own default)
+
+    return clean
+
+
 def _apply_cookies(driver: webdriver.Chrome) -> bool:
     """
-    Loads cookies.json and injects them into the browser.
-    Must be called AFTER driver.get() has already loaded the target domain,
-    so the browser has a cookie jar for that domain.
+    Loads cookies.json and injects them into the browser via JavaScript
+    (document.cookie) as a fallback when Selenium's add_cookie() rejects them.
 
-    Returns True if cookies were applied, False otherwise.
+    Strategy:
+      1. Try Selenium add_cookie() with a cleaned dict  → most reliable
+      2. On failure, fall back to document.cookie via JS → works for non-HttpOnly cookies
+      3. For the two critical auth cookies (sessionid, sessionid_sign),
+         also try the JS path even if add_cookie succeeded, to be safe.
+
+    Must be called AFTER driver.get() has already navigated to the target domain.
+    Returns True if at least one cookie was applied.
     """
     cookie_path = "cookies.json"
     if not os.path.exists(cookie_path):
@@ -91,42 +153,110 @@ def _apply_cookies(driver: webdriver.Chrome) -> bool:
 
     try:
         with open(cookie_path, "r") as f:
-            cookies = json.load(f)
-
-        added = 0
-        for c in cookies:
-            # Keep only fields the WebDriver API accepts
-            clean = {k: v for k, v in c.items()
-                     if k in ("name", "value", "path", "secure", "expiry", "domain", "sameSite")}
-            # Some cookie files store httpOnly / sameParty — skip those keys
-            try:
-                driver.add_cookie(clean)
-                added += 1
-            except Exception as ce:
-                log(f"   ⚠️  Skipped cookie '{c.get('name','?')}': {str(ce)[:60]}")
-
-        log(f"✅ Applied {added}/{len(cookies)} cookies")
-        return added > 0
+            raw_cookies = json.load(f)
     except Exception as e:
-        log(f"⚠️  Cookie load error: {str(e)[:80]}")
+        log(f"⚠️  Could not read cookies.json: {e}")
         return False
+
+    # Get current domain from the browser so we can filter to matching cookies
+    try:
+        current_url  = driver.current_url  # e.g. "https://in.tradingview.com/"
+        current_host = current_url.split("/")[2]  # "in.tradingview.com"
+        base_domain  = ".".join(current_host.split(".")[-2:])  # "tradingview.com"
+    except Exception:
+        base_domain  = "tradingview.com"
+
+    added_selenium = 0
+    added_js       = 0
+    failed         = 0
+
+    for c in raw_cookies:
+        name  = c.get("name", "?")
+        value = c.get("value", "")
+
+        # Skip cookies that clearly belong to a different domain
+        c_domain = str(c.get("domain", "")).lstrip(".")
+        if c_domain and base_domain not in c_domain:
+            log(f"   ⏭  Skipping cookie '{name}' (domain mismatch: {c_domain})")
+            continue
+
+        cleaned = _clean_cookie(c)
+
+        # ── Method 1: Selenium add_cookie ──
+        selenium_ok = False
+        try:
+            driver.add_cookie(cleaned)
+            added_selenium += 1
+            selenium_ok = True
+        except Exception as se:
+            err = str(se)
+            # ── Method 2: JS document.cookie (for non-HttpOnly cookies) ──
+            # Construct a cookie string: name=value; path=/; domain=.tradingview.com; ...
+            try:
+                parts = [f"{name}={value}", f"path={cleaned.get('path', '/')}"]
+                if "expiry" in cleaned:
+                    from datetime import datetime, timezone
+                    exp_dt = datetime.fromtimestamp(cleaned["expiry"], tz=timezone.utc)
+                    parts.append(f"expires={exp_dt.strftime('%a, %d %b %Y %H:%M:%S GMT')}")
+                if cleaned.get("secure"):
+                    parts.append("secure")
+                if "sameSite" in cleaned:
+                    parts.append(f"samesite={cleaned['sameSite']}")
+                # Use the base domain with leading dot for broad coverage
+                parts.append(f"domain=.{base_domain}")
+
+                cookie_str = "; ".join(parts)
+                driver.execute_script(f"document.cookie = {json.dumps(cookie_str)};")
+                added_js += 1
+            except Exception as je:
+                log(f"   ✘ Failed cookie '{name}' — selenium: {err[:50]} | js: {str(je)[:50]}")
+                failed += 1
+
+    total_added = added_selenium + added_js
+    log(f"✅ Cookies applied: {added_selenium} via Selenium + {added_js} via JS "
+        f"| {failed} failed | {total_added}/{len(raw_cookies)} total")
+    return total_added > 0
 
 
 def _validate_session(driver: webdriver.Chrome) -> bool:
     """
-    Quick heuristic: checks that the page doesn't show a 'Sign In' button
-    that would indicate we are NOT logged in.
-    Returns True  → logged-in (or no login required)
-    Returns False → definitely not logged in
+    Validates TradingView login by checking cookies AND page content.
+
+    TradingView session is confirmed by the presence of 'sessionid' cookie.
+    Page content check is a secondary signal.
+
+    Returns True  -> logged in
+    Returns False -> not logged in / session expired
     """
     try:
+        # Primary check: sessionid cookie must exist and be non-empty in the jar
+        session_cookie = driver.execute_script(
+            "return document.cookie.split(';').map(c => c.trim())"
+            ".find(c => c.startsWith('sessionid='));"
+        )
+        if session_cookie and len(session_cookie.split("=", 1)[1].strip()) > 10:
+            log(f"   🔑 Session cookie present: {session_cookie[:35]}...")
+            return True
+
+        # Secondary check: page source signals
         page = driver.page_source.lower()
-        # TradingView shows these text strings when not logged in
-        if 'sign in' in page and 'my account' not in page:
+        logged_in_signals  = ["usermenu", "user-menu", "my profile", "watchlist"]
+        logged_out_signals = ["sign in", "log in", "create account", "get started for free"]
+
+        has_in  = any(s in page for s in logged_in_signals)
+        has_out = any(s in page for s in logged_out_signals)
+
+        if has_in and not has_out:
+            return True
+        if has_out and not has_in:
             return False
+
+        # Ambiguous: default True so scraping is not blocked unnecessarily
         return True
-    except Exception:
-        return False  # treat unknown state as not-logged-in
+
+    except Exception as e:
+        log(f"   ⚠️  Session validation error: {str(e)[:60]}")
+        return False
 
 
 def create_driver() -> webdriver.Chrome:
