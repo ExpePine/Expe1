@@ -15,22 +15,24 @@ from selenium.common.exceptions import (
     TimeoutException,
     WebDriverException,
     InvalidSessionIdException,
-    SessionNotCreatedException
+    SessionNotCreatedException,
+    StaleElementReferenceException
 )
 
 import gspread
+from webdriver_manager.chrome import ChromeDriverManager
 
 def log(msg):
     print(msg, flush=True)
 
-# ---------------- CONFIG ---------------- #
+# ---------------- CONFIG & SHARDING ---------------- #
 SHARD_INDEX = int(os.getenv("SHARD_INDEX", "0"))
-SHARD_STEP = int(os.getenv("SHARD_STEP", "1"))
+SHARD_STEP  = int(os.getenv("SHARD_STEP", "1"))
 MAX_RETRIES = 3
-RETRY_DELAY = 5
-BATCH_SIZE = 50
-START_COL = "A"
-MAX_ROWS = 2600
+RETRY_DELAY = 3
+BATCH_SIZE  = 50
+START_COL   = "A"
+MAX_ROWS    = 2600
 
 checkpoint_file = os.getenv("CHECKPOINT_FILE", f"checkpoint_{SHARD_INDEX}.txt")
 
@@ -43,7 +45,11 @@ if os.path.exists(checkpoint_file):
 
 log(f"🔖 Resuming from row index {last_i}")
 
-# ---------------- DRIVER ---------------- #
+# Keep same path/selector focus
+PRIMARY_SELECTOR = "div.valueValue-l31H9iuA.apply-common-tooltip"
+FALLBACK_SELECTOR = "div.valueValue-l31H9iuA"
+
+# ---------------- BROWSER FACTORY ---------------- #
 def create_driver():
     log("🌐 Initializing Chrome...")
     opts = Options()
@@ -51,32 +57,29 @@ def create_driver():
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--disable-gpu")
+    opts.add_argument("--window-size=1920,1080")
+    opts.add_argument("--blink-settings=imagesEnabled=false")
     opts.add_argument("--disable-extensions")
     opts.add_argument("--disable-background-networking")
     opts.add_argument("--disable-renderer-backgrounding")
-    opts.add_argument("--disable-features=VizDisplayCompositor")
-    opts.add_argument("--window-size=1920,1080")
-    opts.add_argument("--blink-settings=imagesEnabled=false")
-    opts.add_argument("--remote-debugging-port=9222")
     opts.add_experimental_option("excludeSwitches", ["enable-logging"])
-    opts.add_experimental_option("prefs", {
-        "profile.managed_default_content_settings.images": 2
-    })
     opts.add_argument(
         "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/120.0.0.0 Safari/537.36"
     )
 
-    # Use Selenium Manager / local matching driver
-    driver = webdriver.Chrome(options=opts)
-    driver.set_page_load_timeout(50)
+    driver = webdriver.Chrome(
+        service=Service(ChromeDriverManager().install()),
+        options=opts
+    )
+    driver.set_page_load_timeout(45)
     driver.set_script_timeout(30)
 
     if os.path.exists("cookies.json"):
         try:
             driver.get("https://in.tradingview.com/")
-            time.sleep(2)
+            time.sleep(3)
             with open("cookies.json", "r", encoding="utf-8") as f:
                 cookies = json.load(f)
             for c in cookies:
@@ -85,16 +88,14 @@ def create_driver():
                         k: v for k, v in c.items()
                         if k in ("name", "value", "path", "domain", "secure", "expiry")
                     }
-                    if "sameSite" in c:
-                        cookie["sameSite"] = c["sameSite"]
                     driver.add_cookie(cookie)
-                except Exception:
+                except:
                     continue
             driver.refresh()
             time.sleep(2)
             log("✅ Cookies applied")
         except Exception as e:
-            log(f"⚠️ Cookie error: {str(e)[:100]}")
+            log(f"⚠️ Cookie error: {str(e)[:80]}")
 
     return driver
 
@@ -105,43 +106,97 @@ def safe_quit(driver):
     except:
         pass
 
-def restart_driver(driver):
-    safe_quit(driver)
-    time.sleep(2)
-    return create_driver()
+# ---------------- HELPER: EXTRACT TEXT FROM SAME PLACE ---------------- #
+def extract_values_from_same_place(driver):
+    values = []
 
-# ---------------- SCRAPER ---------------- #
+    selectors = [PRIMARY_SELECTOR, FALLBACK_SELECTOR]
+
+    for selector in selectors:
+        try:
+            elements = driver.find_elements(By.CSS_SELECTOR, selector)
+            if not elements:
+                continue
+
+            temp = []
+            for el in elements:
+                try:
+                    txt = (
+                        el.get_attribute("innerText")
+                        or el.get_attribute("textContent")
+                        or el.text
+                        or ""
+                    )
+                    txt = txt.replace('−', '-').replace('∅', 'None').strip()
+                    if txt:
+                        temp.append(txt)
+                except StaleElementReferenceException:
+                    continue
+                except Exception:
+                    continue
+
+            if temp:
+                values = temp
+                break
+
+        except Exception:
+            continue
+
+    return values
+
+def wait_for_values(driver, timeout=45, poll=1.0):
+    end_time = time.time() + timeout
+    last_count = 0
+
+    while time.time() < end_time:
+        values = extract_values_from_same_place(driver)
+        if values:
+            return values
+
+        try:
+            count1 = len(driver.find_elements(By.CSS_SELECTOR, PRIMARY_SELECTOR))
+            count2 = len(driver.find_elements(By.CSS_SELECTOR, FALLBACK_SELECTOR))
+            last_count = max(count1, count2)
+        except Exception:
+            pass
+
+        time.sleep(poll)
+
+    log(f"⏱️ Timeout waiting for non-empty values | seen elements count={last_count}")
+    return []
+
+# ---------------- SCRAPER LOGIC ---------------- #
 def scrape_tradingview(driver, url):
+    """
+    Returns:
+      - list of values on success
+      - [] on timeout/failure
+      - "RESTART" if browser crashed
+    """
     try:
         driver.get(url)
 
-        WebDriverWait(driver, 45).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "div.valueValue-l31H9iuA"))
+        WebDriverWait(driver, 30).until(
+            lambda d: d.execute_script("return document.readyState") == "complete"
         )
 
         time.sleep(2)
 
-        elements = driver.find_elements(By.CSS_SELECTOR, "div.valueValue-l31H9iuA")
-        values = []
-        for el in elements:
-            try:
-                text = el.text.replace('−', '-').replace('∅', 'None').strip()
-                if text:
-                    values.append(text)
-            except:
-                continue
-
+        values = wait_for_values(driver, timeout=30, poll=1.0)
         return values
 
     except TimeoutException:
-        log("⏱️ Timeout waiting for values")
+        log("⏱️ Timeout waiting for page load")
+        return []
+    except NoSuchElementException:
+        log("❌ Element not found")
         return []
     except (InvalidSessionIdException, SessionNotCreatedException):
-        log("🛑 Invalid or closed session")
+        log("🛑 Invalid session/browser closed")
         return "RESTART"
     except WebDriverException as e:
         msg = str(e).lower()
-        log(f"🛑 WebDriverException: {str(e)[:200]}")
+        log(f"🛑 Browser/WebDriver issue: {str(e)[:120]}")
         if (
             "session deleted" in msg
             or "tab crashed" in msg
@@ -152,23 +207,29 @@ def scrape_tradingview(driver, url):
             return "RESTART"
         return []
     except Exception as e:
-        log(f"❌ Unexpected scrape error: {str(e)[:200]}")
+        log(f"❌ Unexpected scrape error: {str(e)[:120]}")
         return []
 
 def scrape_with_retry(driver, url, name, max_retries=MAX_RETRIES):
+    """
+    Wraps scrape_tradingview with retry logic and browser restart on crash.
+    Returns (driver, values_list_or_empty).
+    """
     for attempt in range(1, max_retries + 1):
         result = scrape_tradingview(driver, url)
 
         if result == "RESTART":
             log(f"♻️ Restarting browser for {name} (attempt {attempt})")
-            driver = restart_driver(driver)
+            safe_quit(driver)
+            time.sleep(2)
+            driver = create_driver()
             result = scrape_tradingview(driver, url)
 
             if result == "RESTART":
-                log("🛑 Browser restart failed again, skipping row")
+                log("🛑 Browser restart failed twice, skipping row")
                 return driver, []
 
-        if isinstance(result, list) and result:
+        if isinstance(result, list) and len(result) > 0:
             return driver, result
 
         if attempt < max_retries:
@@ -179,7 +240,7 @@ def scrape_with_retry(driver, url, name, max_retries=MAX_RETRIES):
 
     return driver, []
 
-# ---------------- SHEETS ---------------- #
+# ---------------- FLUSH BATCH TO SHEETS ---------------- #
 def flush_batch(sheet, batch_list):
     if not batch_list:
         return True
@@ -198,18 +259,18 @@ def flush_batch(sheet, batch_list):
             else:
                 time.sleep(5)
 
-    log("❌ Batch failed after 3 attempts")
+    log("❌ Batch failed after 3 attempts — data may be lost for this batch")
     return False
 
-# ---------------- SETUP ---------------- #
+# ---------------- INITIAL SETUP ---------------- #
 log("📊 Connecting to Google Sheets...")
 try:
     gc = gspread.service_account("credentials.json")
     sheet_main = gc.open("Stock List").worksheet("Sheet1")
     sheet_data = gc.open("MV2 for SQL").worksheet("Sheet36")
 
-    company_list = sheet_main.col_values(7)
-    name_list = sheet_main.col_values(1)
+    company_list = sheet_main.col_values(7)   # Column G — URLs
+    name_list    = sheet_main.col_values(1)   # Column A — names
 
     current_date = date.today().strftime("%m/%d/%Y")
     log(f"✅ Loaded {len(company_list)} rows | Shard {SHARD_INDEX}/{SHARD_STEP} | Resume from {last_i}")
@@ -217,20 +278,19 @@ except Exception as e:
     log(f"❌ Setup Error: {e}")
     sys.exit(1)
 
-# ---------------- MAIN ---------------- #
-driver = None
+# ---------------- MAIN LOOP ---------------- #
+driver = create_driver()
 batch_list = []
-pending_checkpoint = last_i
 
 attempted = 0
 succeeded = 0
 skipped_empty_url = 0
 skipped_no_data = 0
+pending_checkpoint = last_i
 
 try:
-    driver = create_driver()
-
     for i in range(len(company_list)):
+
         if SHARD_STEP > 1 and (i % SHARD_STEP) != SHARD_INDEX:
             continue
 
@@ -240,12 +300,12 @@ try:
         if i >= MAX_ROWS:
             break
 
+        url  = company_list[i].strip() if i < len(company_list) and company_list[i] else ""
+        name = name_list[i].strip()    if i < len(name_list) and name_list[i] else f"Row {i+1}"
+
         if i == 0:
             log("⏭️ Skipping header row 1")
             continue
-
-        url = company_list[i].strip() if i < len(company_list) and company_list[i] else ""
-        name = name_list[i].strip() if i < len(name_list) and name_list[i] else f"Row {i+1}"
 
         if not url:
             log(f"⏭️ [{i+1}] {name} — empty URL")
@@ -267,7 +327,7 @@ try:
             })
             succeeded += 1
             pending_checkpoint = i + 1
-            log(f"📦 Buffered {len(values)} values | batch {len(batch_list)}/{BATCH_SIZE}")
+            log(f"✅ Got {len(values)} values | batch {len(batch_list)}/{BATCH_SIZE}")
         else:
             skipped_no_data += 1
             pending_checkpoint = i + 1
@@ -280,7 +340,7 @@ try:
                 with open(checkpoint_file, "w") as f:
                     f.write(str(pending_checkpoint))
 
-        time.sleep(1)
+        time.sleep(0.7)
 
 finally:
     ok = flush_batch(sheet_data, batch_list)
