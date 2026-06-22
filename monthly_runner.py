@@ -23,7 +23,7 @@ START_ROW = SHARD_INDEX * SHARD_SIZE
 END_ROW = START_ROW + SHARD_SIZE
 checkpoint_file = os.getenv("CHECKPOINT_FILE", f"checkpoint_day_{SHARD_INDEX}.txt")
 
-EXPECTED_COUNT = 18  
+EXPECTED_COUNT = 18  # Exact target constraint of 18 rows
 BATCH_SIZE = 50 
 RESTART_EVERY_ROWS = 20
 COOKIE_FILE = os.getenv("COOKIE_FILE", "cookies.json")
@@ -72,24 +72,17 @@ def create_driver():
     log(f"🌐 [Shard {SHARD_INDEX}] Initializing browser...")
     opts = Options()
     
-    if os.path.exists("/usr/bin/google-chrome"):
-        opts.binary_location = "/usr/bin/google-chrome"
-        
-    opts.add_argument("--headless=new")
+    # Use standard reliable system headless fallback mode for GitHub Ubuntu runners
+    opts.add_argument("--headless")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-setuid-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--disable-gpu")
-    opts.add_argument("--remote-debugging-pipe")
+    opts.add_argument("--disable-software-rasterizer")
     
-    # Randomize temporary allocations to prevent session locking
-    rand_id = random.randint(1000, 9999)
-    opts.add_argument(f"--user-data-dir=/tmp/chrome-user-data-{rand_id}")
-    opts.add_argument(f"--data-path=/tmp/chrome-data-path-{rand_id}")
-    opts.add_argument(f"--disk-cache-dir=/tmp/chrome-cache-{rand_id}")
-    
-    opts.add_argument("--window-size=1920,1080")
+    # Automation bypass parameters
     opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_argument("--window-size=1920,1080")
     opts.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
     drv = webdriver.Chrome(options=opts)
@@ -102,15 +95,14 @@ def create_driver():
             with open(COOKIE_FILE, "r", encoding="utf-8") as f:
                 cookies = json.load(f)
             for c in cookies:
-                # Core cookie sanitization payload mapping
                 cookie_dict = {k: v for k, v in c.items() if k in ("name", "value", "path", "secure", "expiry")}
                 if "expiry" in cookie_dict:
                     cookie_dict["expiry"] = int(cookie_dict["expiry"])
                 drv.add_cookie(cookie_dict)
             drv.refresh()
-            time.sleep(3)
+            time.sleep(2)
         except Exception as e:
-            log(f"   ⚠️ Warning: Cookie injection tracking failed: {str(e)[:40]}")
+            log(f"   ⚠️ Cookie parsing configuration bypass: {str(e)[:40]}")
     return drv
 
 def ensure_driver():
@@ -188,7 +180,7 @@ def connect_sheets():
 try:
     sheet_main, sheet_data = connect_sheets()
     company_list = api_retry(sheet_main.col_values, 1)
-    url_list = api_retry(sheet_main.col_values, 7)  
+    url_list = api_retry(sheet_main.col_values, 7)  # Column G Extraction Activated
     
     log(f"✅ Starting rows {last_i + 1} to {min(END_ROW, len(company_list))}")
 except Exception as e:
