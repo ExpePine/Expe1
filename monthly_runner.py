@@ -11,7 +11,6 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 import gspread
-from webdriver_manager.chrome import ChromeDriverManager
 
 def log(msg):
     t = time.strftime("%H:%M:%S")
@@ -24,11 +23,10 @@ START_ROW = SHARD_INDEX * SHARD_SIZE
 END_ROW = START_ROW + SHARD_SIZE
 checkpoint_file = os.getenv("CHECKPOINT_FILE", f"checkpoint_day_{SHARD_INDEX}.txt")
 
-EXPECTED_COUNT = 18  
+EXPECTED_COUNT = 18  # Targeted count exactly at 18 values
 BATCH_SIZE = 50 
 RESTART_EVERY_ROWS = 20
 COOKIE_FILE = os.getenv("COOKIE_FILE", "cookies.json")
-CHROME_DRIVER_PATH = ChromeDriverManager().install()
 
 DAY_OUTPUT_START_COL = 3  
 
@@ -67,7 +65,7 @@ if os.path.exists(checkpoint_file):
 else:
     last_i = START_ROW
 
-# ---------------- DRIVER ---------------- #
+# ---------------- DRIVER FACTORY ---------------- #
 driver = None
 
 def create_driver():
@@ -76,15 +74,19 @@ def create_driver():
     opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--disable-gpu")
     opts.add_argument("--window-size=1920,1080")
     opts.add_argument("--disable-blink-features=AutomationControlled")
     opts.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
-    drv = webdriver.Chrome(service=Service(CHROME_DRIVER_PATH), options=opts)
+    # Native Selenium fallback execution avoids driver collision errors
+    drv = webdriver.Chrome(options=opts)
+    drv.set_page_load_timeout(30)
     
     if os.path.exists(COOKIE_FILE):
         try:
             drv.get("https://in.tradingview.com/")
+            time.sleep(2)
             with open(COOKIE_FILE, "r", encoding="utf-8") as f:
                 cookies = json.load(f)
             for c in cookies:
@@ -129,7 +131,7 @@ def scrape_day(url):
             drv.get(url)
             WebDriverWait(drv, 20).until(EC.presence_of_element_located((By.CSS_SELECTOR, "[class*='valueValue']")))
             
-            time.sleep(3) # Initial render wait
+            time.sleep(3) 
             vals = get_values(drv)
 
             if len(vals) < EXPECTED_COUNT:
@@ -153,9 +155,10 @@ def scrape_day(url):
                 padded = (vals + [""] * EXPECTED_COUNT)[:EXPECTED_COUNT]
                 return padded, "NOT OK", url, browser_url
                 
-        except Exception:
-            log(f"   ❌ Attempt {attempt + 1} Failed")
+        except Exception as err:
+            log(f"   ❌ Attempt {attempt + 1} Failed: {str(err)[:60]}")
             restart_driver()
+            time.sleep(2)  # Critical delay window allows context allocation to refresh cleanly
             
     return [""] * EXPECTED_COUNT, "NOT OK", url, ""
 
@@ -187,9 +190,7 @@ def process_row(i, company_list, url_list, current_date):
 try:
     sheet_main, sheet_data = connect_sheets()
     company_list = api_retry(sheet_main.col_values, 1)
-    
-    # URL List targets Column G (7)
-    url_list = api_retry(sheet_main.col_values, 7)
+    url_list = api_retry(sheet_main.col_values, 7)  # Column G Tracking Applied
     
     log(f"✅ Starting rows {last_i + 1} to {min(END_ROW, len(company_list))}")
 except Exception as e:
