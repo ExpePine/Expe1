@@ -26,7 +26,7 @@ jobs:
         with:
           python-version: '3.10'
 
-      - run: pip install selenium beautifulsoup4 gspread webdriver-manager
+      - run: pip install selenium beautifulsoup4 selenium-stealth gspread webdriver-manager
 
       - run: echo '${{ secrets.GSPREAD_CREDENTIALS }}' > credentials.json
       - run: echo '${{ secrets.TRADINGVIEW_COOKIES }}' > cookies.json
