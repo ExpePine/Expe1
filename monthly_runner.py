@@ -2,354 +2,237 @@ import sys
 import os
 import time
 import json
+import random
 from datetime import date
-
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import (
-    NoSuchElementException,
-    TimeoutException,
-    WebDriverException,
-    InvalidSessionIdException,
-    SessionNotCreatedException,
-    StaleElementReferenceException
-)
-
 import gspread
 from webdriver_manager.chrome import ChromeDriverManager
 
 def log(msg):
-    print(msg, flush=True)
+    t = time.strftime("%H:%M:%S")
+    print(f"[{t}] {msg}", flush=True)
 
-# ---------------- CONFIG & SHARDING ---------------- #
+# ---------------- CONFIG ---------------- #
 SHARD_INDEX = int(os.getenv("SHARD_INDEX", "0"))
-SHARD_STEP  = int(os.getenv("SHARD_STEP", "1"))
-MAX_RETRIES = 3
-RETRY_DELAY = 3
-BATCH_SIZE  = 50
-START_COL   = "A"
-MAX_ROWS    = 2600
+SHARD_SIZE = int(os.getenv("SHARD_SIZE", "500"))
+START_ROW = SHARD_INDEX * SHARD_SIZE
+END_ROW = START_ROW + SHARD_SIZE
+checkpoint_file = os.getenv("CHECKPOINT_FILE", f"checkpoint_day_{SHARD_INDEX}.txt")
 
-checkpoint_file = os.getenv("CHECKPOINT_FILE", f"checkpoint_{SHARD_INDEX}.txt")
+EXPECTED_COUNT = 30
+BATCH_SIZE = 50 
+RESTART_EVERY_ROWS = 20
+COOKIE_FILE = os.getenv("COOKIE_FILE", "cookies.json")
+CHROME_DRIVER_PATH = ChromeDriverManager().install()
 
-last_i = 0
+DAY_OUTPUT_START_COL = 3  
+
+# ---------------- UTILS ---------------- #
+def col_num_to_letter(n):
+    result = ""
+    while n > 0:
+        n, rem = divmod(n - 1, 26)
+        result = chr(65 + rem) + result
+    return result
+
+DAY_START_COL_LETTER = col_num_to_letter(DAY_OUTPUT_START_COL)
+DAY_END_COL_LETTER = col_num_to_letter(DAY_OUTPUT_START_COL + EXPECTED_COUNT - 1)
+
+STATUS_COL = col_num_to_letter(DAY_OUTPUT_START_COL + EXPECTED_COUNT)
+SHEET_URL_COL = col_num_to_letter(DAY_OUTPUT_START_COL + EXPECTED_COUNT + 1)
+BROWSER_URL_COL = col_num_to_letter(DAY_OUTPUT_START_COL + EXPECTED_COUNT + 2)
+
+def api_retry(func, *args, **kwargs):
+    for attempt in range(5):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            wait = (2 ** attempt) + random.random()
+            log(f"⚠️ API Issue: {str(e)[:50]}. Retrying in {wait:.1f}s...")
+            time.sleep(wait)
+    return func(*args, **kwargs)
+
+# ---------------- STATE ---------------- #
 if os.path.exists(checkpoint_file):
     try:
-        last_i = int(open(checkpoint_file).read().strip())
+        last_i = max(int(open(checkpoint_file).read().strip()), START_ROW)
     except:
-        last_i = 0
+        last_i = START_ROW
+else:
+    last_i = START_ROW
 
-log(f"🔖 Resuming from row index {last_i}")
+# ---------------- DRIVER ---------------- #
+driver = None
 
-# Keep same path/selector focus
-PRIMARY_SELECTOR = "div.valueValue-l31H9iuA.apply-common-tooltip"
-FALLBACK_SELECTOR = "div.valueValue-l31H9iuA"
-
-# ---------------- BROWSER FACTORY ---------------- #
 def create_driver():
-    log("🌐 Initializing Chrome...")
+    log(f"🌐 [Shard {SHARD_INDEX}] Initializing browser...")
     opts = Options()
     opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--disable-gpu")
     opts.add_argument("--window-size=1920,1080")
-    opts.add_argument("--blink-settings=imagesEnabled=false")
-    opts.add_argument("--disable-extensions")
-    opts.add_argument("--disable-background-networking")
-    opts.add_argument("--disable-renderer-backgrounding")
-    opts.add_experimental_option("excludeSwitches", ["enable-logging"])
-    opts.add_argument(
-        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    )
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
-    driver = webdriver.Chrome(
-        service=Service(ChromeDriverManager().install()),
-        options=opts
-    )
-    driver.set_page_load_timeout(45)
-    driver.set_script_timeout(30)
-
-    if os.path.exists("cookies.json"):
+    drv = webdriver.Chrome(service=Service(CHROME_DRIVER_PATH), options=opts)
+    
+    if os.path.exists(COOKIE_FILE):
         try:
-            driver.get("https://in.tradingview.com/")
-            time.sleep(3)
-            with open("cookies.json", "r", encoding="utf-8") as f:
+            drv.get("https://in.tradingview.com/")
+            with open(COOKIE_FILE, "r", encoding="utf-8") as f:
                 cookies = json.load(f)
             for c in cookies:
-                try:
-                    cookie = {
-                        k: v for k, v in c.items()
-                        if k in ("name", "value", "path", "domain", "secure", "expiry")
-                    }
-                    driver.add_cookie(cookie)
-                except:
-                    continue
-            driver.refresh()
+                drv.add_cookie({k: v for k, v in c.items() if k in ("name", "value", "path", "secure", "expiry")})
+            drv.refresh()
             time.sleep(2)
-            log("✅ Cookies applied")
-        except Exception as e:
-            log(f"⚠️ Cookie error: {str(e)[:80]}")
+        except: pass
+    return drv
 
+def ensure_driver():
+    global driver
+    if driver is None:
+        driver = create_driver()
     return driver
 
-def safe_quit(driver):
-    try:
-        if driver:
+def restart_driver():
+    global driver
+    if driver:
+        try:
             driver.quit()
-    except:
-        pass
+        except: pass
+    driver = None
 
-# ---------------- HELPER: EXTRACT TEXT FROM SAME PLACE ---------------- #
-def extract_values_from_same_place(driver):
-    values = []
-
-    selectors = [PRIMARY_SELECTOR, FALLBACK_SELECTOR]
-
-    for selector in selectors:
-        try:
-            elements = driver.find_elements(By.CSS_SELECTOR, selector)
-            if not elements:
-                continue
-
-            temp = []
-            for el in elements:
-                try:
-                    txt = (
-                        el.get_attribute("innerText")
-                        or el.get_attribute("textContent")
-                        or el.text
-                        or ""
-                    )
-                    txt = txt.replace('−', '-').replace('∅', 'None').strip()
-                    if txt:
-                        temp.append(txt)
-                except StaleElementReferenceException:
-                    continue
-                except Exception:
-                    continue
-
-            if temp:
-                values = temp
-                break
-
-        except Exception:
-            continue
-
-    return values
-
-def wait_for_values(driver, timeout=45, poll=1.0):
-    end_time = time.time() + timeout
-    last_count = 0
-
-    while time.time() < end_time:
-        values = extract_values_from_same_place(driver)
-        if values:
-            return values
-
-        try:
-            count1 = len(driver.find_elements(By.CSS_SELECTOR, PRIMARY_SELECTOR))
-            count2 = len(driver.find_elements(By.CSS_SELECTOR, FALLBACK_SELECTOR))
-            last_count = max(count1, count2)
-        except Exception:
-            pass
-
-        time.sleep(poll)
-
-    log(f"⏱️ Timeout waiting for non-empty values | seen elements count={last_count}")
-    return []
-
-# ---------------- SCRAPER LOGIC ---------------- #
-def scrape_tradingview(driver, url):
-    """
-    Returns:
-      - list of values on success
-      - [] on timeout/failure
-      - "RESTART" if browser crashed
-    """
+# ---------------- SCRAPER ---------------- #
+def get_values(drv):
     try:
-        driver.get(url)
-
-        WebDriverWait(driver, 30).until(
-            lambda d: d.execute_script("return document.readyState") == "complete"
-        )
-
-        time.sleep(2)
-
-        values = wait_for_values(driver, timeout=30, poll=1.0)
-        return values
-
-    except TimeoutException:
-        log("⏱️ Timeout waiting for page load")
-        return []
-    except NoSuchElementException:
-        log("❌ Element not found")
-        return []
-    except (InvalidSessionIdException, SessionNotCreatedException):
-        log("🛑 Invalid session/browser closed")
-        return "RESTART"
-    except WebDriverException as e:
-        msg = str(e).lower()
-        log(f"🛑 Browser/WebDriver issue: {str(e)[:120]}")
-        if (
-            "session deleted" in msg
-            or "tab crashed" in msg
-            or "invalid session id" in msg
-            or "chrome not reachable" in msg
-            or "session not created" in msg
-        ):
-            return "RESTART"
-        return []
-    except Exception as e:
-        log(f"❌ Unexpected scrape error: {str(e)[:120]}")
+        elements = drv.find_elements(By.CSS_SELECTOR, "[class*='valueValue']")
+        vals = [el.text.strip() for el in elements if el.text.strip()]
+        return vals
+    except:
         return []
 
-def scrape_with_retry(driver, url, name, max_retries=MAX_RETRIES):
-    """
-    Wraps scrape_tradingview with retry logic and browser restart on crash.
-    Returns (driver, values_list_or_empty).
-    """
-    for attempt in range(1, max_retries + 1):
-        result = scrape_tradingview(driver, url)
-
-        if result == "RESTART":
-            log(f"♻️ Restarting browser for {name} (attempt {attempt})")
-            safe_quit(driver)
-            time.sleep(2)
-            driver = create_driver()
-            result = scrape_tradingview(driver, url)
-
-            if result == "RESTART":
-                log("🛑 Browser restart failed twice, skipping row")
-                return driver, []
-
-        if isinstance(result, list) and len(result) > 0:
-            return driver, result
-
-        if attempt < max_retries:
-            log(f"⚠️ Empty result for {name}, retry {attempt}/{max_retries} in {RETRY_DELAY}s...")
-            time.sleep(RETRY_DELAY)
-        else:
-            log(f"❌ All {max_retries} attempts failed for {name}")
-
-    return driver, []
-
-# ---------------- FLUSH BATCH TO SHEETS ---------------- #
-def flush_batch(sheet, batch_list):
-    if not batch_list:
-        return True
-
-    for attempt in range(3):
+def scrape_day(url):
+    if not url: return [""] * EXPECTED_COUNT, "NOT OK", "", ""
+    
+    for attempt in range(2):
         try:
-            sheet.batch_update(batch_list)
-            log(f"🚀 Saved {len(batch_list)} rows")
-            return True
-        except Exception as e:
-            log(f"⚠️ Sheets API error: {e}")
-            if "429" in str(e) or "quota" in str(e).lower():
-                wait = 60 * (attempt + 1)
-                log(f"⏳ Quota hit — sleeping {wait}s...")
-                time.sleep(wait)
+            drv = ensure_driver()
+            drv.get(url)
+            WebDriverWait(drv, 20).until(EC.presence_of_element_located((By.CSS_SELECTOR, "[class*='valueValue']")))
+            
+            time.sleep(3) # Initial render wait
+            vals = get_values(drv)
+
+            if len(vals) < EXPECTED_COUNT:
+                for scroll_y in [600, 1200, 2000]:
+                    drv.execute_script(f"window.scrollTo(0, {scroll_y});")
+                    time.sleep(1.5)
+                    new_vals = get_values(drv)
+                    if len(new_vals) > len(vals): vals = new_vals
+                    if len(vals) >= EXPECTED_COUNT: break
+
+            browser_url = drv.current_url
+            found_count = len(vals)
+            
+            # Logic: Strictly OK or NOT OK
+            if found_count >= EXPECTED_COUNT:
+                log(f"   ✅ Found {found_count}/{EXPECTED_COUNT}")
+                return vals[:EXPECTED_COUNT], "OK", url, browser_url
             else:
-                time.sleep(5)
+                log(f"   ⚠️ Found {found_count}/{EXPECTED_COUNT} (Marking NOT OK)")
+                padded = (vals + [""] * EXPECTED_COUNT)[:EXPECTED_COUNT]
+                return padded, "NOT OK", url, browser_url
+                
+        except Exception:
+            log(f"   ❌ Attempt {attempt + 1} Failed")
+            restart_driver()
+            
+    return [""] * EXPECTED_COUNT, "NOT OK", url, ""
 
-    log("❌ Batch failed after 3 attempts — data may be lost for this batch")
-    return False
-
-# ---------------- INITIAL SETUP ---------------- #
-log("📊 Connecting to Google Sheets...")
-try:
+# ---------------- MAIN ---------------- #
+def connect_sheets():
     gc = gspread.service_account("credentials.json")
-    sheet_main = gc.open("Stock List").worksheet("Sheet1")
-    sheet_data = gc.open("MV2 for SQL").worksheet("Sheet36")
+    sh_main = gc.open("Stock List").worksheet("Sheet1")
+    sh_data = gc.open("MV2 for SQL").worksheet("Sheet36")
+    return sh_main, sh_data
 
-    company_list = sheet_main.col_values(7)   # Column G — URLs
-    name_list    = sheet_main.col_values(1)   # Column A — names
+def process_row(i, company_list, url_list, current_date):
+    name = company_list[i].strip() if i < len(company_list) else ""
+    url = url_list[i].strip() if i < len(url_list) and "http" in url_list[i] else None
+    
+    log(f"🔍 [{i + 1}] {name}")
+    vals, status, sheet_url_used, browser_url_used = scrape_day(url)
+    
+    row_idx = i + 1
+    row_payload = [
+        {"range": f"A{row_idx}", "values": [[name]]},
+        {"range": f"B{row_idx}", "values": [[current_date]]},
+        {"range": f"{DAY_START_COL_LETTER}{row_idx}:{DAY_END_COL_LETTER}{row_idx}", "values": [vals]},
+        {"range": f"{STATUS_COL}{row_idx}", "values": [[status]]},
+        {"range": f"{SHEET_URL_COL}{row_idx}", "values": [[sheet_url_used]]},
+        {"range": f"{BROWSER_URL_COL}{row_idx}", "values": [[browser_url_used]]}
+    ]
+    return row_payload, (status == "OK")
 
-    current_date = date.today().strftime("%m/%d/%Y")
-    log(f"✅ Loaded {len(company_list)} rows | Shard {SHARD_INDEX}/{SHARD_STEP} | Resume from {last_i}")
+try:
+    sheet_main, sheet_data = connect_sheets()
+    company_list = api_retry(sheet_main.col_values, 1)
+    url_list = api_retry(sheet_main.col_values, 4)
+    log(f"✅ Starting rows {last_i + 1} to {min(END_ROW, len(company_list))}")
 except Exception as e:
-    log(f"❌ Setup Error: {e}")
+    log(f"❌ Connection Error: {e}")
     sys.exit(1)
 
-# ---------------- MAIN LOOP ---------------- #
-driver = create_driver()
+retry_indices = []
 batch_list = []
+current_date = date.today().strftime("%m/%d/%Y")
+loop_end = min(END_ROW, len(company_list))
 
-attempted = 0
-succeeded = 0
-skipped_empty_url = 0
-skipped_no_data = 0
-pending_checkpoint = last_i
+# --- FIRST PASS ---
+for i in range(last_i, loop_end):
+    payload, success = process_row(i, company_list, url_list, current_date)
+    batch_list.extend(payload)
+    
+    if not success:
+        retry_indices.append(i)
 
-try:
-    for i in range(len(company_list)):
+    with open(checkpoint_file, "w") as f:
+        f.write(str(i + 1))
 
-        if SHARD_STEP > 1 and (i % SHARD_STEP) != SHARD_INDEX:
-            continue
+    if (i + 1) % RESTART_EVERY_ROWS == 0:
+        restart_driver()
 
-        if i < last_i:
-            continue
+    if len(batch_list) // 6 >= BATCH_SIZE:
+        log(f"🚀 Uploading batch...")
+        api_retry(sheet_data.batch_update, batch_list, value_input_option="RAW")
+        batch_list = []
 
-        if i >= MAX_ROWS:
-            break
+if batch_list:
+    api_retry(sheet_data.batch_update, batch_list, value_input_option="RAW")
+    batch_list = []
 
-        url  = company_list[i].strip() if i < len(company_list) and company_list[i] else ""
-        name = name_list[i].strip()    if i < len(name_list) and name_list[i] else f"Row {i+1}"
+# --- RETRY PASS ---
+if retry_indices:
+    log(f"🔁 Retrying {len(retry_indices)} symbols labeled 'NOT OK'...")
+    restart_driver()
+    batch_list = []
+    
+    for idx, i in enumerate(retry_indices):
+        payload, success = process_row(i, company_list, url_list, current_date)
+        batch_list.extend(payload)
+        
+        if (idx + 1) % 10 == 0:
+            restart_driver()
+            api_retry(sheet_data.batch_update, batch_list, value_input_option="RAW")
+            batch_list = []
 
-        if i == 0:
-            log("⏭️ Skipping header row 1")
-            continue
+    if batch_list:
+        api_retry(sheet_data.batch_update, batch_list, value_input_option="RAW")
 
-        if not url:
-            log(f"⏭️ [{i+1}] {name} — empty URL")
-            skipped_empty_url += 1
-            with open(checkpoint_file, "w") as f:
-                f.write(str(i + 1))
-            continue
-
-        log(f"🔍 [{i+1}] {name}")
-        attempted += 1
-
-        driver, values = scrape_with_retry(driver, url, name)
-
-        if values:
-            target_row = i + 1
-            batch_list.append({
-                "range": f"{START_COL}{target_row}",
-                "values": [values]
-            })
-            succeeded += 1
-            pending_checkpoint = i + 1
-            log(f"✅ Got {len(values)} values | batch {len(batch_list)}/{BATCH_SIZE}")
-        else:
-            skipped_no_data += 1
-            pending_checkpoint = i + 1
-            log(f"⚠️ [{i+1}] {name} — no data after retries")
-
-        if len(batch_list) >= BATCH_SIZE:
-            ok = flush_batch(sheet_data, batch_list)
-            if ok:
-                batch_list = []
-                with open(checkpoint_file, "w") as f:
-                    f.write(str(pending_checkpoint))
-
-        time.sleep(0.7)
-
-finally:
-    ok = flush_batch(sheet_data, batch_list)
-    if ok:
-        with open(checkpoint_file, "w") as f:
-            f.write(str(pending_checkpoint))
-
-    safe_quit(driver)
-
-    log("=" * 50)
-    log(f"🏁 Done | Attempted: {attempted} | Succeeded: {succeeded} | No-data: {skipped_no_data} | Empty-URL: {skipped_empty_url}")
-    log("=" * 50)
+restart_driver()
+log("🏁 SCRAPING COMPLETED.")
