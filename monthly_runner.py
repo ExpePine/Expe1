@@ -114,7 +114,6 @@ def get_values(drv):
     try:
         wait = WebDriverWait(drv, 20)
 
-        # Wait for at least something to load
         wait.until(
             EC.presence_of_all_elements_located(
                 (By.CSS_SELECTOR, "[class*='valueValue']")
@@ -126,31 +125,34 @@ def get_values(drv):
         values = []
         seen = set()
 
-        for el in elements:
+        logger.info("------ RAW SCRAPE DEBUG START ------")
+
+        for i, el in enumerate(elements):
             try:
-                if not el.is_displayed():
-                    continue
-
                 text = el.text.strip()
+                visible = el.is_displayed()
 
+                logger.info(f"[{i}] visible={visible} text='{text}'")
+
+                if not visible:
+                    continue
                 if not text:
                     continue
-
-                # avoid duplicates
                 if text in seen:
                     continue
 
                 seen.add(text)
                 values.append(text)
 
-            except:
-                continue
+            except Exception as e:
+                logger.info(f"[{i}] ERROR reading element: {e}")
 
-        # STRICT LIMIT (important)
         values = values[:EXPECTED_COUNT]
 
-        logger.info(f"RAW FOUND: {len(elements)} | FINAL: {len(values)}")
-        logger.info(f"VALUES: {values}")
+        logger.info("------ FINAL RESULT ------")
+        logger.info(f"FINAL COUNT: {len(values)} / {EXPECTED_COUNT}")
+        logger.info(f"FINAL VALUES: {values}")
+        logger.info("--------------------------")
 
         return values
 
