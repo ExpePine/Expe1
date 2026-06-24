@@ -88,17 +88,44 @@ def create_driver():
 
 
 # ---------------- SCRAPER LOGIC ---------------- #
+def save_debug(driver, prefix):
+    try:
+        ts = int(time.time())
+
+        screenshot_file = f"{prefix}_{ts}.png"
+        html_file = f"{prefix}_{ts}.html"
+
+        driver.save_screenshot(screenshot_file)
+
+        with open(html_file, "w", encoding="utf-8") as f:
+            f.write(driver.page_source)
+
+        log(f"📸 Saved screenshot: {screenshot_file}")
+        log(f"💾 Saved HTML: {html_file}")
+
+    except Exception as e:
+        log(f"⚠️ Debug save failed: {e}")
+
+
 def scrape_tradingview(driver, url):
     """
     Returns:
-      - list of values (possibly empty) on success
-      - "RESTART" if browser crashed
+      - list of values
+      - []
+      - "RESTART"
     """
+
     try:
+
+        log("=" * 100)
+        log("🌍 VISITING URL")
+        log(url)
+
         driver.get(url)
 
-        # ✅ FIX: Use a CSS class wait instead of a brittle full XPath.
-        # Wait for ANY element with this class to appear — much more resilient.
+        log(f"📍 FINAL URL: {driver.current_url}")
+        log(f"📄 PAGE TITLE: {driver.title}")
+
         WebDriverWait(driver, 45).until(
             EC.presence_of_element_located((
                 By.CSS_SELECTOR,
@@ -106,29 +133,92 @@ def scrape_tradingview(driver, url):
             ))
         )
 
-        # Small extra wait to let all values render
-        time.sleep(1.5)
+        time.sleep(2)
+
+        html_size = len(driver.page_source)
+        log(f"📏 HTML SIZE: {html_size:,} chars")
 
         soup = BeautifulSoup(driver.page_source, "html.parser")
-        values = [
-            el.get_text().replace('−', '-').replace('∅', 'None').strip()
-            for el in soup.find_all(
-                "div",
-                class_="valueValue-l31H9iuA apply-common-tooltip"
+
+        elements = soup.find_all(
+            "div",
+            class_="valueValue-l31H9iuA apply-common-tooltip"
+        )
+
+        log(f"🔢 ELEMENTS FOUND: {len(elements)}")
+
+        values = []
+
+        for idx, el in enumerate(elements, start=1):
+
+            value = (
+                el.get_text()
+                .replace("−", "-")
+                .replace("∅", "None")
+                .strip()
             )
-        ]
+
+            values.append(value)
+
+            log(f"   [{idx}] {value}")
+
+        log(f"✅ TOTAL VALUES: {len(values)}")
+
+        if not values:
+
+            log("❌ NO VALUES FOUND")
+
+            save_debug(driver, "no_values")
+
+            try:
+                classes = set()
+
+                for div in soup.find_all("div"):
+                    cls = div.get("class")
+                    if cls:
+                        classes.add(" ".join(cls))
+
+                log("📋 SAMPLE CLASSES FOUND:")
+
+                for cls in list(classes)[:50]:
+                    log(f"   {cls}")
+
+            except:
+                pass
+
         return values
 
     except TimeoutException:
-        log("⏱️ Timeout waiting for values")
+
+        log("⏱️ TIMEOUT WAITING FOR VALUE ELEMENTS")
+
+        save_debug(driver, "timeout")
+
         return []
+
     except NoSuchElementException:
-        log("❌ Element not found")
+
+        log("❌ ELEMENT NOT FOUND")
+
+        save_debug(driver, "element_missing")
+
         return []
+
     except WebDriverException as e:
-        log(f"🛑 Browser crash: {str(e)[:80]}")
+
+        log(f"🛑 BROWSER CRASH")
+        log(str(e)[:500])
+
         return "RESTART"
 
+    except Exception as e:
+
+        log(f"💥 UNKNOWN ERROR")
+        log(str(e))
+
+        save_debug(driver, "unknown_error")
+
+        return []
 
 def scrape_with_retry(driver, url, name, max_retries=MAX_RETRIES):
     """
@@ -156,7 +246,10 @@ def scrape_with_retry(driver, url, name, max_retries=MAX_RETRIES):
 
         # Empty result — wait and retry
         if attempt < max_retries:
-            log(f"⚠️ Empty result for {name}, retry {attempt}/{max_retries} in {RETRY_DELAY}s...")
+            log("⚠️ EMPTY RESULT")
+        log(f"NAME  : {name}")
+        log(f"URL   : {url}")
+        log(f"RETRY : {attempt}/{max_retries}")
             time.sleep(RETRY_DELAY)
         else:
             log(f"❌ All {max_retries} attempts failed for {name}")
@@ -245,7 +338,12 @@ try:
                 f.write(str(i + 1))
             continue
 
-        log(f"🔍 [{i+1}] {name}")
+        log("")
+        log("=" * 100)
+        log(f"ROW : {i+1}")
+        log(f"NAME: {name}")
+        log(f"URL : {url}")
+        log("=" * 100)
         attempted += 1
 
         driver, values = scrape_with_retry(driver, url, name)
@@ -257,7 +355,15 @@ try:
                 "values": [values]
             })
             succeeded += 1
-            log(f"📦 Buffered {len(values)} values | batch {len(batch_list)}/{BATCH_SIZE}")
+            log("📊 VALUES RECEIVED")
+
+for idx, val in enumerate(values, start=1):
+    log(f"   [{idx}] {val}")
+
+log(
+    f"📦 Buffered {len(values)} values | "
+    f"batch {len(batch_list)}/{BATCH_SIZE}"
+)
         else:
             skipped_no_data += 1
             log(f"⚠️ [{i+1}] {name} — no data after retries")
