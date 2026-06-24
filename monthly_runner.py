@@ -22,10 +22,10 @@ def log(msg):
 # ---------------- CONFIG & SHARDING ---------------- #
 SHARD_INDEX = int(os.getenv("SHARD_INDEX", "0"))
 SHARD_STEP  = int(os.getenv("SHARD_STEP", "1"))
-MAX_RETRIES = 3         # retries per URL before giving up
-RETRY_DELAY = 3         # seconds between retries
+MAX_RETRIES = 3
+RETRY_DELAY = 5
 BATCH_SIZE  = 50
-START_COL   = "DH"      # first column to write scraped values
+START_COL   = "DH"
 
 checkpoint_file = os.getenv("CHECKPOINT_FILE", f"checkpoint_{SHARD_INDEX}.txt")
 
@@ -38,7 +38,6 @@ if os.path.exists(checkpoint_file):
 
 log(f"🔖 Resuming from row index {last_i}")
 
-
 # ---------------- BROWSER FACTORY ---------------- #
 def create_driver():
     log("🌐 Initializing Chrome...")
@@ -49,87 +48,62 @@ def create_driver():
     opts.add_argument("--disable-gpu")
     opts.add_argument("--window-size=1920,1080")
     opts.add_argument("--blink-settings=imagesEnabled=false")
-    opts.add_experimental_option("excludeSwitches", ["enable-logging"])
-    opts.add_argument(
-        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    )
+    opts.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
-    driver = webdriver.Chrome(
-        service=Service(ChromeDriverManager().install()),
-        options=opts
-    )
-    driver.set_page_load_timeout(40)
+    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=opts)
+    driver.set_page_load_timeout(60)
 
     if os.path.exists("cookies.json"):
         try:
             driver.get("https://in.tradingview.com/")
-            time.sleep(3)
             with open("cookies.json", "r") as f:
                 cookies = json.load(f)
             for c in cookies:
-                try:
-                    driver.add_cookie({
-                        k: v for k, v in c.items()
-                        if k in ("name", "value", "path", "secure", "expiry")
-                    })
-                except:
-                    continue
+                driver.add_cookie({k: v for k, v in c.items() if k in ("name", "value", "path", "secure", "expiry")})
             driver.refresh()
-            time.sleep(2)
+            time.sleep(3)
             log("✅ Cookies applied")
         except Exception as e:
-            log(f"⚠️ Cookie error: {str(e)[:60]}")
-
+            log(f"⚠️ Cookie error: {e}")
     return driver
 
-
 # ---------------- SCRAPER LOGIC ---------------- #
-def save_debug(driver, prefix):
-    try:
-        ts = int(time.time())
-        screenshot_file = f"{prefix}_{ts}.png"
-        html_file = f"{prefix}_{ts}.html"
-        driver.save_screenshot(screenshot_file)
-        with open(html_file, "w", encoding="utf-8") as f:
-            f.write(driver.page_source)
-        log(f"📸 Saved screenshot: {screenshot_file}")
-        log(f"💾 Saved HTML: {html_file}")
-    except Exception as e:
-        log(f"⚠️ Debug save failed: {e}")
-
-
 def scrape_tradingview(driver, url):
     try:
-        log("🌍 VISITING URL: " + url)
+        log(f"🌍 VISITING URL: {url}")
         driver.get(url)
         WebDriverWait(driver, 45).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, "div.valueValue-l31H9iuA"))
         )
-        time.sleep(2)
+        time.sleep(3)
         soup = BeautifulSoup(driver.page_source, "html.parser")
         elements = soup.find_all("div", class_="valueValue-l31H9iuA apply-common-tooltip")
         
-        values = []
-        for el in elements:
-            val = el.get_text().replace("−", "-").replace("∅", "None").strip()
-            values.append(val)
-        
+        values = [el.get_text().replace("−", "-").replace("∅", "None").strip() for el in elements]
         return values
+    except (WebDriverException, TimeoutException):
+        return "RESTART"
     except Exception as e:
-        log(f"Error scraping {url}: {e}")
+        log(f"💥 Error: {e}")
         return []
 
 def scrape_with_retry(driver, url, name, max_retries=MAX_RETRIES):
     for attempt in range(1, max_retries + 1):
-        values = scrape_tradingview(driver, url)
-        if values:
-            return driver, values
+        result = scrape_tradingview(driver, url)
+        
+        if result == "RESTART":
+            log(f"♻️ Restarting browser (Attempt {attempt})")
+            try: driver.quit()
+            except: pass
+            driver = create_driver()
+            continue
+            
+        if isinstance(result, list) and len(result) > 0:
+            return driver, result
+            
         log(f"⚠️ Attempt {attempt} failed for {name}")
         time.sleep(RETRY_DELAY)
     return driver, []
-
 
 # ---------------- MAIN LOOP ---------------- #
 gc = gspread.service_account("credentials.json")
@@ -141,8 +115,6 @@ name_list = sheet_main.col_values(1)
 
 driver = create_driver()
 batch_list = []
-attempted = 0
-succeeded = 0
 
 for i in range(len(company_list)):
     if SHARD_STEP > 1 and (i % SHARD_STEP) != SHARD_INDEX:
@@ -160,15 +132,8 @@ for i in range(len(company_list)):
     driver, values = scrape_with_retry(driver, url, name)
 
     if values:
-        log(f"✅ Captured {len(values)} values:")
-        for idx, val in enumerate(values, start=1):
-            log(f"   [{idx}] {val}")
-        
-        batch_list.append({
-            "range": f"{START_COL}{i+1}",
-            "values": [values]
-        })
-        succeeded += 1
+        log(f"📊 VALUES RECEIVED for {name}: {values}")
+        batch_list.append({"range": f"{START_COL}{i+1}", "values": [values]})
     
     if len(batch_list) >= BATCH_SIZE:
         sheet_data.batch_update(batch_list)
@@ -177,4 +142,7 @@ for i in range(len(company_list)):
     with open(checkpoint_file, "w") as f:
         f.write(str(i + 1))
 
+if batch_list:
+    sheet_data.batch_update(batch_list)
 driver.quit()
+log("🏁 Done.")
