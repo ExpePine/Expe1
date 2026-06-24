@@ -110,13 +110,53 @@ def restart_driver():
         except: pass
     driver = None
 
-# ---------------- SCRAPER ---------------- #
 def get_values(drv):
     try:
-        elements = drv.find_elements(By.CSS_SELECTOR, "[class*='valueValue']")
-        return [el.text.strip() for el in elements if el.text.strip()]
-    except: return []
+        wait = WebDriverWait(drv, 20)
 
+        # Wait for at least something to load
+        wait.until(
+            EC.presence_of_all_elements_located(
+                (By.CSS_SELECTOR, "[class*='valueValue']")
+            )
+        )
+
+        elements = drv.find_elements(By.CSS_SELECTOR, "[class*='valueValue']")
+
+        values = []
+        seen = set()
+
+        for el in elements:
+            try:
+                if not el.is_displayed():
+                    continue
+
+                text = el.text.strip()
+
+                if not text:
+                    continue
+
+                # avoid duplicates
+                if text in seen:
+                    continue
+
+                seen.add(text)
+                values.append(text)
+
+            except:
+                continue
+
+        # STRICT LIMIT (important)
+        values = values[:EXPECTED_COUNT]
+
+        logger.info(f"RAW FOUND: {len(elements)} | FINAL: {len(values)}")
+        logger.info(f"VALUES: {values}")
+
+        return values
+
+    except Exception as e:
+        logger.error(f"get_values error: {e}")
+        return []
 def scrape_day(url):
     if not url: return [""] * EXPECTED_COUNT, "NOT OK", "", ""
     drv = ensure_driver()
