@@ -82,25 +82,43 @@ def scrape_tradingview(driver, url):
         log(f"🌍 VISITING URL: {url}")
         driver.get(url)
         
-        # Target the specific dynamic data blocks
-        target_css = "div.valueValue-l31H9iuA"
+        # Using a wildcard CSS selector prefix to stay safe against changing layout hash suffixes
+        target_css = "div[class^='valueValue-']" 
         
-        log(f"⏳ Waiting up to 45s for base elements ({target_css}) to appear...")
-        WebDriverWait(driver, 45).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, target_css))
-        )
+        log(f"⏳ Waiting up to 45s for base elements to appear...")
+        try:
+            WebDriverWait(driver, 45).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, target_css))
+            )
+        except TimeoutException:
+            log(f"🛑 TIMEOUT HIT for {url}. Capturing visual evidence...")
+            
+            # Create a screenshots directory for GitHub Artifact pickup
+            os.makedirs("screenshots", exist_ok=True)
+            
+            # Create a clean safe name out of the asset string or URL configuration
+            safe_name = url.split("symbol=")[-1].replace("%3A", "_") if "symbol=" in url else "timeout_page"
+            screenshot_path = f"screenshots/{safe_name}_{int(time.time())}.png"
+            
+            try:
+                driver.set_window_size(1920, 1080)
+                driver.save_screenshot(screenshot_path)
+                log(f"📸 SCREENSHOT SAVED SUCCESSFUL: {screenshot_path}")
+            except Exception as ss_err:
+                log(f"⚠️ Could not write screenshot to disk: {ss_err}")
+                
+            return "RESTART"
         
-        # TradingView loads chunks as you interact or viewport triggers lazily.
-        # Micro-scrolling wakes up dynamic components.
-        log("📜 Executing viewport micro-scrolls to trigger element initialization...")
+        # Micro-scrolling wakes up hidden dynamic layout components
+        log("📜 Executing viewport micro-scrolls...")
         driver.execute_script("window.scrollTo(0, 300);")
         time.sleep(1.5)
         driver.execute_script("window.scrollTo(0, 0);")
-        time.sleep(3.5) # Solid breathe time for script processing layouts
+        time.sleep(3.5) 
         
         log("📸 Capturing DOM source code structure...")
         soup = BeautifulSoup(driver.page_source, "html.parser")
-        elements = soup.find_all("div", class_="valueValue-l31H9iuA apply-common-tooltip")
+        elements = soup.find_all("div", class_=lambda x: x and x.startswith("valueValue-"))
         
         values = [el.get_text().replace("−", "-").replace("∅", "None").strip() for el in elements]
         
@@ -108,8 +126,8 @@ def scrape_tradingview(driver, url):
         log(f"📝 [DATA ARRAY DETAILS]: {values}")
         
         return values
-    except (WebDriverException, TimeoutException) as e:
-        log(f"⚠️ Connection or Timeout issue hit: {str(e)[:100]}. Triggering browser pipeline rebuild...")
+    except WebDriverException as e:
+        log(f"⚠️ Connection issue hit: {str(e)[:100]}. Triggering browser pipeline rebuild...")
         return "RESTART"
     except Exception as e:
         log(f"💥 Parsing Failure Error: {e}")
