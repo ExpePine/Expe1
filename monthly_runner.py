@@ -40,7 +40,7 @@ log(f"🔖 Resuming from row index {last_i}")
 
 # ---------------- BROWSER FACTORY ---------------- #
 def create_driver():
-    log("🌐 Initializing Chrome...")
+    log("🌐 Initializing Chrome Driver...")
     opts = Options()
     opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
@@ -55,16 +55,25 @@ def create_driver():
 
     if os.path.exists("cookies.json"):
         try:
+            log("🍪 Found cookies.json. Navigating to TradingView domain base to inject...")
             driver.get("https://in.tradingview.com/")
+            time.sleep(3) # Ensure initial domain frame context is ready
+            
             with open("cookies.json", "r") as f:
                 cookies = json.load(f)
+            
+            log(f"📦 Injecting {len(cookies)} cookies into the browser context...")
             for c in cookies:
                 driver.add_cookie({k: v for k, v in c.items() if k in ("name", "value", "path", "secure", "expiry")})
+            
+            log("🔄 Refreshing page to apply cookies...")
             driver.refresh()
-            time.sleep(3)
-            log("✅ Cookies applied")
+            time.sleep(5) # Let authentication and UI adjust to state
+            log("✅ Cookies applied successfully.")
         except Exception as e:
             log(f"⚠️ Cookie error: {e}")
+    else:
+        log("ℹ️ No cookies.json detected. Proceeding guest mode.")
     return driver
 
 # ---------------- SCRAPER LOGIC ---------------- #
@@ -72,46 +81,75 @@ def scrape_tradingview(driver, url):
     try:
         log(f"🌍 VISITING URL: {url}")
         driver.get(url)
+        
+        # Target the specific dynamic data blocks
+        target_css = "div.valueValue-l31H9iuA"
+        
+        log(f"⏳ Waiting up to 45s for base elements ({target_css}) to appear...")
         WebDriverWait(driver, 45).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "div.valueValue-l31H9iuA"))
+            EC.presence_of_element_located((By.CSS_SELECTOR, target_css))
         )
-        time.sleep(3)
+        
+        # TradingView loads chunks as you interact or viewport triggers lazily.
+        # Micro-scrolling wakes up dynamic components.
+        log("📜 Executing viewport micro-scrolls to trigger element initialization...")
+        driver.execute_script("window.scrollTo(0, 300);")
+        time.sleep(1.5)
+        driver.execute_script("window.scrollTo(0, 0);")
+        time.sleep(3.5) # Solid breathe time for script processing layouts
+        
+        log("📸 Capturing DOM source code structure...")
         soup = BeautifulSoup(driver.page_source, "html.parser")
         elements = soup.find_all("div", class_="valueValue-l31H9iuA apply-common-tooltip")
         
         values = [el.get_text().replace("−", "-").replace("∅", "None").strip() for el in elements]
+        
+        log(f"📊 [DATA COLLECTION] Extracted Count: {len(values)} values.")
+        log(f"📝 [DATA ARRAY DETAILS]: {values}")
+        
         return values
-    except (WebDriverException, TimeoutException):
+    except (WebDriverException, TimeoutException) as e:
+        log(f"⚠️ Connection or Timeout issue hit: {str(e)[:100]}. Triggering browser pipeline rebuild...")
         return "RESTART"
     except Exception as e:
-        log(f"💥 Error: {e}")
+        log(f"💥 Parsing Failure Error: {e}")
         return []
 
 def scrape_with_retry(driver, url, name, max_retries=MAX_RETRIES):
     for attempt in range(1, max_retries + 1):
+        log(f"🔄 Processing Attempt {attempt}/{max_retries} for asset: {name}")
         result = scrape_tradingview(driver, url)
         
         if result == "RESTART":
-            log(f"♻️ Restarting browser (Attempt {attempt})")
-            try: driver.quit()
-            except: pass
+            log(f"♻️ Restarting browser instance entirely (Attempt {attempt})")
+            try: 
+                driver.quit()
+            except: 
+                pass
             driver = create_driver()
             continue
             
         if isinstance(result, list) and len(result) > 0:
             return driver, result
             
-        log(f"⚠️ Attempt {attempt} failed for {name}")
-        time.sleep(RETRY_DELAY)
+        log(f"⚠️ Attempt {attempt} returned empty data array for {name}")
+        if attempt < max_retries:
+            log(f"💤 Sleeping {RETRY_DELAY}s before next retry sweep...")
+            time.sleep(RETRY_DELAY)
+            
+    log(f"❌ All {max_retries} attempts exhausted. Moving on with empty payload.")
     return driver, []
 
 # ---------------- MAIN LOOP ---------------- #
+log("🔗 Authenticating with Google Sheets API...")
 gc = gspread.service_account("credentials.json")
 sheet_main = gc.open("Stock List").worksheet("Sheet1")
 sheet_data = gc.open("MV2 for SQL").worksheet("Sheet36")
 
+log("Reading configuration columns from source file...")
 company_list = sheet_main.col_values(7)
 name_list = sheet_main.col_values(1)
+log(f"📋 Loaded {len(company_list)} potential target addresses.")
 
 driver = create_driver()
 batch_list = []
@@ -126,23 +164,32 @@ for i in range(len(company_list)):
     name = name_list[i].strip() if i < len(name_list) else f"Row {i+1}"
 
     if not url:
+        log(f"⏭️ Skipping Row {i+1}: Missing link information.")
         continue
 
-    log(f"\n--- Processing Row {i+1}: {name} ---")
+    log(f"\n{"="*30}\n🚀 PROCESSING ROW {i+1}: {name}\n{"="*30}")
     driver, values = scrape_with_retry(driver, url, name)
 
     if values:
-        log(f"📊 VALUES RECEIVED for {name}: {values}")
-        batch_list.append({"range": f"{START_COL}{i+1}", "values": [values]})
+        target_range = f"{START_COL}{i+1}"
+        log(f"💾 Staging values to write to range {target_range}")
+        batch_list.append({"range": target_range, "values": [values]})
+    else:
+        log(f"🛑 No data parsed or written for row {i+1} ({name})")
     
     if len(batch_list) >= BATCH_SIZE:
+        log(f"📤 [BATCH LIMIT REACHED] Sending {len(batch_list)} records to Google Sheets...")
         sheet_data.batch_update(batch_list)
+        log("✨ Batch sync update completed successfully.")
         batch_list = []
     
     with open(checkpoint_file, "w") as f:
         f.write(str(i + 1))
 
 if batch_list:
+    log(f"📤 [FINAL SYNC] Flushing remaining {len(batch_list)} database items...")
     sheet_data.batch_update(batch_list)
+    log("✨ Final flush complete.")
+
 driver.quit()
-log("🏁 Done.")
+log("🏁 Execution pipeline completed. Done.")
