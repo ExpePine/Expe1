@@ -25,7 +25,7 @@ SHARD_STEP  = int(os.getenv("SHARD_STEP", "1"))
 MAX_RETRIES = 3
 RETRY_DELAY = 5
 BATCH_SIZE  = 50
-START_COL   = "DH"
+START_COL   = "D"
 
 checkpoint_file = os.getenv("CHECKPOINT_FILE", f"checkpoint_{SHARD_INDEX}.txt")
 
