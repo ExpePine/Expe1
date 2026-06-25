@@ -167,7 +167,7 @@ for i in range(len(company_list)):
         log(f"⏭️ Skipping Row {i+1}: Missing link information.")
         continue
 
-    log(f"\n{"="*30}\n🚀 PROCESSING ROW {i+1}: {name}\n{"="*30}")
+    log(f"\n{'-'*30}\n🚀 PROCESSING ROW {i+1}: {name}\n{'-'*30}")
     driver, values = scrape_with_retry(driver, url, name)
 
     if values:
