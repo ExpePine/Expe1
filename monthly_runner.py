@@ -57,7 +57,7 @@ def create_driver():
         try:
             log("🍪 Found cookies.json. Navigating to TradingView domain base to inject...")
             driver.get("https://in.tradingview.com/")
-            time.sleep(3) # Ensure initial domain frame context is ready
+            time.sleep(3)
             
             with open("cookies.json", "r") as f:
                 cookies = json.load(f)
@@ -68,7 +68,7 @@ def create_driver():
             
             log("🔄 Refreshing page to apply cookies...")
             driver.refresh()
-            time.sleep(5) # Let authentication and UI adjust to state
+            time.sleep(5)
             log("✅ Cookies applied successfully.")
         except Exception as e:
             log(f"⚠️ Cookie error: {e}")
@@ -82,7 +82,6 @@ def scrape_tradingview(driver, url):
         log(f"🌍 VISITING URL: {url}")
         driver.get(url)
         
-        # Using a wildcard CSS selector prefix to stay safe against changing layout hash suffixes
         target_css = "div[class^='valueValue-']" 
         
         log(f"⏳ Waiting up to 45s for base elements to appear...")
@@ -92,11 +91,7 @@ def scrape_tradingview(driver, url):
             )
         except TimeoutException:
             log(f"🛑 TIMEOUT HIT for {url}. Capturing visual evidence...")
-            
-            # Create a screenshots directory for GitHub Artifact pickup
             os.makedirs("screenshots", exist_ok=True)
-            
-            # Create a clean safe name out of the asset string or URL configuration
             safe_name = url.split("symbol=")[-1].replace("%3A", "_") if "symbol=" in url else "timeout_page"
             screenshot_path = f"screenshots/{safe_name}_{int(time.time())}.png"
             
@@ -109,7 +104,6 @@ def scrape_tradingview(driver, url):
                 
             return "RESTART"
         
-        # Micro-scrolling wakes up hidden dynamic layout components
         log("📜 Executing viewport micro-scrolls...")
         driver.execute_script("window.scrollTo(0, 300);")
         time.sleep(1.5)
@@ -120,12 +114,17 @@ def scrape_tradingview(driver, url):
         soup = BeautifulSoup(driver.page_source, "html.parser")
         elements = soup.find_all("div", class_=lambda x: x and x.startswith("valueValue-"))
         
-        values = [el.get_text().replace("−", "-").replace("∅", "None").strip() for el in elements]
+        # Raw pulled array containing both header quotes and indicators
+        all_values = [el.get_text().replace("−", "-").replace("∅", "None").strip() for el in elements]
         
-        log(f"📊 [DATA COLLECTION] Extracted Count: {len(values)} values.")
-        log(f"📝 [DATA ARRAY DETAILS]: {values}")
+        # FILTER: The first 10 values belong to the top quote panel (price, open, high, low, volume, etc.)
+        # We slice them off to keep only the technical matrix block starting from index 10.
+        filtered_values = all_values[10:] if len(all_values) >= 10 else all_values
         
-        return values
+        log(f"📊 [DATA COLLECTION] Total Extracted: {len(all_values)} | Kept: {len(filtered_values)} values.")
+        log(f"📝 [DATA ARRAY DETAILS]: {filtered_values}")
+        
+        return filtered_values
     except WebDriverException as e:
         log(f"⚠️ Connection issue hit: {str(e)[:100]}. Triggering browser pipeline rebuild...")
         return "RESTART"
