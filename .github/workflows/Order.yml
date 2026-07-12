@@ -15,11 +15,12 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.11"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
+          pip install "setuptools<70"
           pip install selenium undetected-chromedriver
 
       - name: Run Script
@@ -33,3 +34,4 @@ jobs:
         with:
           name: blinkit-orders-output
           path: blinkit_output/
+          if-no-files-found: warn
