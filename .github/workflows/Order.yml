@@ -1,0 +1,50 @@
+name: Blinkit Orders Fetcher
+
+on:
+  workflow_dispatch:
+
+jobs:
+  fetch-blinkit-orders:
+
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 15
+
+    permissions:
+      contents: read
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Google Chrome
+        uses: browser-actions/setup-chrome@v1
+
+      - name: Show Chrome version
+        run: google-chrome --version || chrome --version
+
+      - name: Install Python packages
+        run: |
+          python -m pip install --upgrade pip
+          pip install selenium
+
+      - name: Run Blinkit Order Fetcher
+        env:
+          BLINKIT_COOKIES_JSON: ${{ secrets.BLINKIT_COOKIES_JSON }}
+        run: |
+          python blinkit_orders.py
+
+      - name: Upload Blinkit output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: blinkit-orders-output
+          path: blinkit_output/
+          if-no-files-found: warn
+          retention-days: 7
