@@ -6,7 +6,7 @@ on:
 jobs:
   fetch-blinkit-orders:
 
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
 
     timeout-minutes: 15
 
@@ -22,12 +22,6 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
-      - name: Install Google Chrome
-        uses: browser-actions/setup-chrome@v1
-
-      - name: Show Chrome version
-        run: google-chrome --version || chrome --version
 
       - name: Install Python packages
         run: |
