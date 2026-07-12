@@ -38,7 +38,7 @@ jobs:
         env:
           BLINKIT_COOKIES_JSON: ${{ secrets.BLINKIT_COOKIES_JSON }}
         run: |
-          python blinkit_orders.py
+          python Order.py
 
       - name: Upload Blinkit output
         if: always()
