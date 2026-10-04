@@ -1280,7 +1280,7 @@ try:
 
     url_list = api_retry(
         sheet_main.col_values,
-        4
+        5
     )
 
     log(
