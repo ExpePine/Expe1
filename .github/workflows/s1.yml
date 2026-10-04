@@ -1,7 +1,9 @@
-name: T1 (Shards 0–4)
+name: T1 Shard 0-4 (Rows 1-510)
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: '5 11 * * 1-5'
 
 jobs:
   scrape:
@@ -9,10 +11,9 @@ jobs:
 
     strategy:
       fail-fast: false
-      max-parallel: 2
-
+      max-parallel: 5
       matrix:
-        shard: [0, 1, 2, 3, 4]
+        shard_index: [0, 1, 2, 3, 4]
 
     steps:
       - uses: actions/checkout@v4
@@ -22,39 +23,16 @@ jobs:
           python-version: '3.10'
 
       - name: Install dependencies
-        run: |
-          pip install selenium beautifulsoup4 gspread webdriver-manager
+        run: pip install selenium beautifulsoup4 gspread webdriver-manager
 
-      - name: Create credentials
+      - name: Write credentials
         run: |
           echo '${{ secrets.GSPREAD_CREDENTIALS }}' > credentials.json
-
-      - name: Create TradingView cookies
-        run: |
           echo '${{ secrets.TRADINGVIEW_COOKIES }}' > cookies.json
-
-      - name: Prepare checkpoint
-        run: |
-          FILE="checkpoint_group1_${{ matrix.shard }}.txt"
-
-          if [ ! -f "$FILE" ]; then
-            echo "0" > "$FILE"
-          fi
-
-          echo "Checkpoint file: $FILE"
-          echo "Checkpoint value:"
-          cat "$FILE"
 
       - name: Run scraper
         env:
-          SHARD_INDEX: ${{ matrix.shard }}
-          SHARD_SIZE: 500
-          CHECKPOINT_FILE: checkpoint_group1_${{ matrix.shard }}.txt
-        run: |
-          echo "========================================"
-          echo "Shard: $SHARD_INDEX"
-          echo "Shard size: $SHARD_SIZE"
-          echo "Checkpoint: $CHECKPOINT_FILE"
-          echo "========================================"
-
-          python run_scraper.py
+          SHARD_INDEX: ${{ matrix.shard_index }}
+          SHARD_SIZE: 102
+          CHECKPOINT_FILE: checkpoint_${{ matrix.shard_index }}.txt
+        run: python run_scraper.py
