@@ -1145,9 +1145,9 @@ def connect_sheets():
     )
 
     sh_data = gc.open(
-        "MV2 DAY"
+        "Tradingview Data Reel Experimental May"
     ).worksheet(
-        "Sheet1"
+        "Sheet20"
     )
 
     return sh_main, sh_data
